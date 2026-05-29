@@ -8,10 +8,11 @@ This repository keeps DINO purity as a deterministic fallback expert. Semantic a
 - `clip`: optional real CLIP region-crop scoring through `open_clip`
 - `--mask-backend fallback`: deterministic class-agnostic fallback masks, the default option
 - `--mask-backend sam`: optional SAM/MobileSAM class-agnostic masks from a user-provided checkpoint
-- region purity expert: patch-level proxy features
+- `--feature-backend fallback`: deterministic patch-level proxy features for region purity
+- `--feature-backend dinov2`: optional DINOv2 dense patch features for region purity
 - text expert: fixed positive and negative prompt templates, no external LLM
 
-The routing code is model-agnostic, so a real DINO adapter can replace the fallback purity expert later.
+DINOv2 is used only for region purity / spatial uncertainty. It is not used for class prediction.
 
 The current `clip` backend is region crop-level CLIP scoring. It is not dense CLIP or ClearCLIP logits.
 
@@ -39,6 +40,15 @@ python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car"
 ```
 
 SAM/MobileSAM weights must be provided through `--sam-checkpoint`; they are not downloaded by this project and should not be committed to the repository. If `segment-anything` / `mobile-sam`, the checkpoint path, or model initialization is unavailable, the CLI exits with a clear mask backend error.
+
+To use the optional DINOv2 feature backend:
+
+```bash
+pip install -r requirements-dino.txt
+python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car" --output outputs/demo.png --feature-backend dinov2 --dinov2-model facebook/dinov2-small
+```
+
+DINOv2 weights are loaded by `transformers` into its normal user cache, not into this repository. If `transformers`, `torch`, model weights, or network/cache access are unavailable, the CLI exits with a clear feature backend error.
 
 The command saves:
 

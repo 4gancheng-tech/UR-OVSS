@@ -50,6 +50,10 @@ class MaskBackendError(RuntimeError):
     """Raised when a mask generation backend cannot be initialized or used."""
 
 
+class FeatureBackendError(RuntimeError):
+    """Raised when a feature extraction backend cannot be initialized or used."""
+
+
 @dataclass
 class RegionSemanticScores:
     """Container for region-level semantic scores.
@@ -466,6 +470,219 @@ def build_patch_proxy_features(image_array: np.ndarray) -> np.ndarray:
             patch_features[y0:y1, x0:x1] = prototype
 
     return normalize_last_dim(patch_features.reshape(-1, channels)).reshape(height, width, channels)
+
+
+def resize_feature_grid(feature_grid: np.ndarray, output_shape: Tuple[int, int]) -> np.ndarray:
+    """Resize a patch feature grid to image resolution channel by channel.
+
+    Args:
+        feature_grid: Patch features with shape [Hp, Wp, D].
+        output_shape: Target spatial shape [H, W].
+
+    Returns:
+        Resized feature map with shape [H, W, D].
+    """
+
+    height, width = output_shape
+    channels = feature_grid.shape[-1]
+    resized = np.empty((height, width, channels), dtype=np.float32)
+    resample = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    for channel in range(channels):
+        channel_image = Image.fromarray(feature_grid[..., channel].astype(np.float32), mode="F")
+        resized[..., channel] = np.asarray(channel_image.resize((width, height), resample=resample), dtype=np.float32)
+    return resized
+
+
+class FallbackFeatureAdapter:
+    """Deterministic patch-proxy feature adapter used by the default MVP path."""
+
+    description = "fallback patch proxy features"
+
+    def extract_features(self, image: Image.Image, image_array: np.ndarray) -> np.ndarray:
+        """Extract fallback dense features for region purity estimation.
+
+        Args:
+            image: RGB PIL image. Unused by the fallback backend.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+
+        Returns:
+            L2-normalized feature map with shape [H, W, D].
+        """
+
+        del image
+        return build_patch_proxy_features(image_array).astype(np.float32)
+
+
+class Dinov2FeatureAdapter:
+    """Optional DINOv2 dense patch feature adapter backed by transformers."""
+
+    description = "dinov2 dense patch features"
+
+    def __init__(
+        self,
+        model_name: str = "facebook/dinov2-small",
+        device: Optional[str] = None,
+        transformers_module: Optional[Any] = None,
+    ) -> None:
+        """Load a DINOv2 model for region purity features.
+
+        Args:
+            model_name: Hugging Face model id or local model path.
+            device: Device string such as "cpu" or "cuda".
+            transformers_module: Optional module-like object for tests.
+        """
+
+        self.model_name = model_name
+        self.device = device or self._default_device()
+        if transformers_module is None:
+            try:
+                from transformers import AutoImageProcessor, Dinov2Model
+            except ImportError as exc:
+                raise FeatureBackendError(
+                    "The DINOv2 feature backend requires transformers. Install optional dependencies with "
+                    "`pip install -r requirements-dino.txt`."
+                ) from exc
+        else:
+            AutoImageProcessor = transformers_module.AutoImageProcessor
+            Dinov2Model = transformers_module.Dinov2Model
+
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(model_name)
+            self.model = Dinov2Model.from_pretrained(model_name)
+            if hasattr(self.model, "to"):
+                self.model = self.model.to(self.device)
+            if hasattr(self.model, "eval"):
+                self.model.eval()
+        except Exception as exc:
+            raise FeatureBackendError(
+                f"Failed to load DINOv2 model {model_name!r}. Install `requirements-dino.txt`, "
+                "check network/cache access, or provide a valid local model path."
+            ) from exc
+
+    def _default_device(self) -> str:
+        """Choose CUDA when torch is installed and a GPU is visible."""
+
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    def extract_features(self, image: Image.Image, image_array: np.ndarray) -> np.ndarray:
+        """Extract image-sized DINOv2 patch features.
+
+        Args:
+            image: RGB PIL image.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+
+        Returns:
+            L2-normalized float32 feature map with shape [H, W, D].
+        """
+
+        try:
+            inputs = self.processor(images=image, return_tensors="pt")
+            if hasattr(inputs, "to"):
+                inputs = inputs.to(self.device)
+            elif isinstance(inputs, dict):
+                inputs = {
+                    key: value.to(self.device) if hasattr(value, "to") else value
+                    for key, value in inputs.items()
+                }
+            with clip_inference_context():
+                outputs = self.model(**inputs)
+        except Exception as exc:
+            raise FeatureBackendError(f"DINOv2 feature extraction failed: {exc}") from exc
+
+        hidden_state = getattr(outputs, "last_hidden_state", None)
+        if hidden_state is None:
+            raise FeatureBackendError("DINOv2 model output does not contain last_hidden_state.")
+
+        token_array = tensor_to_numpy(hidden_state)
+        if token_array.ndim != 3 or token_array.shape[0] < 1:
+            raise FeatureBackendError(f"DINOv2 last_hidden_state must have shape [1, N, D], got {token_array.shape}.")
+
+        patch_height, patch_width = self._processed_patch_grid(inputs, token_array.shape[1])
+        patch_grid = self._tokens_to_patch_grid(token_array[0], patch_height, patch_width)
+        dense_features = resize_feature_grid(patch_grid, image_array.shape[:2])
+        normalized = normalize_last_dim(dense_features.reshape(-1, dense_features.shape[-1])).reshape(
+            dense_features.shape
+        )
+        return normalized.astype(np.float32)
+
+    def _processed_patch_grid(self, inputs: Any, token_count: int) -> Tuple[int, int]:
+        """Infer the processed image patch grid from pixel_values or tokens."""
+
+        pixel_values = inputs.get("pixel_values") if hasattr(inputs, "get") else None
+        if pixel_values is not None and hasattr(pixel_values, "shape"):
+            shape = tuple(pixel_values.shape)
+            if len(shape) == 4:
+                patch_size = int(getattr(getattr(self.model, "config", None), "patch_size", 14))
+                return max(1, int(shape[-2]) // patch_size), max(1, int(shape[-1]) // patch_size)
+
+        return self._infer_square_grid(token_count - 1 if token_count > 1 else token_count)
+
+    def _tokens_to_patch_grid(self, tokens: np.ndarray, patch_height: int, patch_width: int) -> np.ndarray:
+        """Convert DINOv2 token sequence to a patch grid.
+
+        Args:
+            tokens: Token features with shape [N, D].
+            patch_height: Expected patch grid height.
+            patch_width: Expected patch grid width.
+
+        Returns:
+            Patch feature grid with shape [Hp, Wp, D].
+        """
+
+        expected_tokens = patch_height * patch_width
+        if tokens.shape[0] == expected_tokens + 1:
+            patch_tokens = tokens[1:]
+        elif tokens.shape[0] == expected_tokens:
+            patch_tokens = tokens
+        else:
+            inferred_height, inferred_width = self._infer_square_grid(tokens.shape[0] - 1)
+            if inferred_height * inferred_width == tokens.shape[0] - 1:
+                patch_tokens = tokens[1:]
+                patch_height, patch_width = inferred_height, inferred_width
+            else:
+                inferred_height, inferred_width = self._infer_square_grid(tokens.shape[0])
+                patch_tokens = tokens
+                patch_height, patch_width = inferred_height, inferred_width
+
+        if patch_tokens.shape[0] != patch_height * patch_width:
+            raise FeatureBackendError(
+                "Cannot reshape DINOv2 patch tokens into a dense grid: "
+                f"tokens={patch_tokens.shape[0]}, grid={patch_height}x{patch_width}."
+            )
+        return patch_tokens.reshape(patch_height, patch_width, patch_tokens.shape[-1]).astype(np.float32)
+
+    def _infer_square_grid(self, token_count: int) -> Tuple[int, int]:
+        """Infer a square-ish patch grid for token-only outputs."""
+
+        if token_count <= 0:
+            raise FeatureBackendError("DINOv2 output did not include any patch tokens.")
+        height = int(np.sqrt(token_count))
+        while height > 1 and token_count % height != 0:
+            height -= 1
+        return height, token_count // height
+
+
+def build_feature_adapter(feature_backend: str, dinov2_model: str = "facebook/dinov2-small") -> Any:
+    """Build the requested region-purity feature adapter.
+
+    Args:
+        feature_backend: Feature backend name, either "fallback" or "dinov2".
+        dinov2_model: DINOv2 model id or local path for the "dinov2" backend.
+
+    Returns:
+        Adapter object exposing extract_features().
+    """
+
+    if feature_backend == "fallback":
+        return FallbackFeatureAdapter()
+    if feature_backend == "dinov2":
+        return Dinov2FeatureAdapter(model_name=dinov2_model)
+    raise ValueError(f"Unknown feature backend {feature_backend!r}; expected 'fallback' or 'dinov2'.")
 
 
 def pool_mask_scores(dense_scores: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -906,6 +1123,8 @@ def run_inference(
     output_path: Path,
     semantic_backend: str = "fallback",
     mask_backend: str = "fallback",
+    feature_backend: str = "fallback",
+    dinov2_model: str = "facebook/dinov2-small",
     sam_checkpoint: Optional[Path] = None,
     sam_model_type: str = "vit_b",
     max_masks: int = 100,
@@ -918,6 +1137,9 @@ def run_inference(
         output_path: PNG visualization path.
         semantic_backend: Semantic expert backend, either "fallback" or "clip".
         mask_backend: Mask backend, either "fallback" or "sam".
+        feature_backend: Region-purity feature backend, either "fallback" or
+            "dinov2".
+        dinov2_model: DINOv2 model id or local path.
         sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
         sam_model_type: SAM model type key.
         max_masks: Maximum number of masks to keep.
@@ -939,12 +1161,13 @@ def run_inference(
         sam_model_type=sam_model_type,
         max_masks=max_masks,
     )
+    feature_adapter = build_feature_adapter(feature_backend, dinov2_model=dinov2_model)
 
     height, width = image_array.shape[:2]
     masks = mask_adapter.generate_masks(pil_image, image_array)
     if not masks:
         raise MaskBackendError(f"Mask backend {mask_backend!r} did not generate any mask.")
-    dino_features = build_patch_proxy_features(image_array)
+    dino_features = feature_adapter.extract_features(pil_image, image_array)
 
     region_work: List[Dict[str, Any]] = []
     for region_id, mask_record in enumerate(masks):
@@ -1024,7 +1247,7 @@ def run_inference(
         "experts": {
             "semantic": semantic_adapter.description,
             "spatial": mask_adapter.description,
-            "purity": "fallback patch proxy features; replace with DINO features when available",
+            "purity": feature_adapter.description,
             "text": "template positive/negative prompts, no external LLM",
         },
         "positive_prompts": positive_prompts,
@@ -1064,6 +1287,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Class-agnostic mask backend. 'sam' requires optional SAM dependencies and --sam-checkpoint.",
     )
     parser.add_argument(
+        "--feature-backend",
+        choices=("fallback", "dinov2"),
+        default="fallback",
+        help="Region-purity feature backend. 'dinov2' requires optional transformers dependencies.",
+    )
+    parser.add_argument(
+        "--dinov2-model",
+        default="facebook/dinov2-small",
+        help="DINOv2 model id or local path used when --feature-backend dinov2 is selected.",
+    )
+    parser.add_argument(
         "--sam-checkpoint",
         type=Path,
         default=None,
@@ -1095,6 +1329,8 @@ def main() -> None:
             args.output,
             semantic_backend=args.semantic_backend,
             mask_backend=args.mask_backend,
+            feature_backend=args.feature_backend,
+            dinov2_model=args.dinov2_model,
             sam_checkpoint=args.sam_checkpoint,
             sam_model_type=args.sam_model_type,
             max_masks=args.max_masks,
@@ -1103,6 +1339,8 @@ def main() -> None:
         raise SystemExit(f"Semantic backend error: {exc}") from exc
     except MaskBackendError as exc:
         raise SystemExit(f"Mask backend error: {exc}") from exc
+    except FeatureBackendError as exc:
+        raise SystemExit(f"Feature backend error: {exc}") from exc
     outputs = result["outputs"]
     print("UR-OVSS MVP inference complete.")
     print(f"Visualization: {outputs['visualization']}")
@@ -1112,10 +1350,10 @@ def main() -> None:
     print(f"Debug JSON: {outputs['debug_json']}")
     if args.semantic_backend == "fallback":
         print("Note: semantic backend used deterministic fallback features, not real CLIP weights.")
-    else:
-        print("Note: DINO purity still uses deterministic fallback features.")
     if args.mask_backend == "fallback":
         print("Note: mask backend used deterministic fallback masks, not real SAM masks.")
+    if args.feature_backend == "fallback":
+        print("Note: feature backend used deterministic fallback features, not real DINOv2 features.")
 
 
 if __name__ == "__main__":
