@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import numpy as np
@@ -40,6 +42,27 @@ RHO_SPA = 0.30
 NEGATIVE_PROMPT_SUPPRESSION_ALPHA = 0.30
 
 
+class SemanticBackendError(RuntimeError):
+    """Raised when a semantic expert backend cannot be initialized or used."""
+
+
+@dataclass
+class RegionSemanticScores:
+    """Container for region-level semantic scores.
+
+    Attributes:
+        base_scores: Base class scores with shape [C].
+        positive_scores: Positive prompt scores with shape [C, P].
+        negative_scores: Negative prompt scores with shape [C, N].
+        prompt_rescore_scores: Prompt-rescored class scores with shape [C].
+    """
+
+    base_scores: np.ndarray
+    positive_scores: np.ndarray
+    negative_scores: np.ndarray
+    prompt_rescore_scores: np.ndarray
+
+
 def parse_class_names(classes: str) -> List[str]:
     """Parse a comma-separated open-vocabulary class list.
 
@@ -53,6 +76,8 @@ def parse_class_names(classes: str) -> List[str]:
     class_names = [name.strip() for name in classes.split(",") if name.strip()]
     if not class_names:
         raise SystemExit("--classes must contain at least one non-empty class name.")
+    if len(class_names) < 2:
+        raise SystemExit("--classes must contain at least two class names for top1-top2 semantic margin.")
     return class_names
 
 
@@ -281,6 +306,318 @@ def pool_mask_features(features: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return normalize_last_dim(features[mask].mean(axis=0)).astype(np.float32)
 
 
+def tensor_to_numpy(values: Any) -> np.ndarray:
+    """Convert tensor-like CLIP outputs to float32 numpy arrays.
+
+    Args:
+        values: Torch tensor, fake tensor from tests, or numpy-like array.
+
+    Returns:
+        Float32 numpy array with the same logical shape.
+    """
+
+    if hasattr(values, "detach") and callable(values.detach):
+        values = values.detach()
+    if hasattr(values, "cpu") and callable(values.cpu):
+        values = values.cpu()
+    if hasattr(values, "numpy") and callable(values.numpy):
+        values = values.numpy()
+    return np.asarray(values, dtype=np.float32)
+
+
+def clip_inference_context() -> Any:
+    """Return a no-gradient context for CLIP inference when torch is available."""
+
+    try:
+        import torch
+
+        return torch.inference_mode()
+    except Exception:
+        return nullcontext()
+
+
+def flatten_prompt_dict(prompt_dict: Dict[str, List[str]], class_names: Sequence[str]) -> List[str]:
+    """Flatten a class-to-prompts mapping in class order.
+
+    Args:
+        prompt_dict: Mapping from class name to prompt list.
+        class_names: Class names with length C.
+
+    Returns:
+        Prompt list with length C * P.
+    """
+
+    return [prompt for class_name in class_names for prompt in prompt_dict[class_name]]
+
+
+class FallbackSemanticAdapter:
+    """Deterministic CLIP-like semantic adapter used by the default MVP path."""
+
+    description = "fallback dense proxy logits"
+
+    def __init__(self) -> None:
+        """Initialize an empty fallback semantic adapter."""
+
+        self.dense_features: Optional[np.ndarray] = None
+
+    def prepare_image(self, image: Image.Image, image_array: np.ndarray) -> None:
+        """Precompute dense proxy features for one image.
+
+        Args:
+            image: RGB PIL image. Unused by the fallback backend.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+        """
+
+        del image
+        self.dense_features = build_dense_proxy_features(image_array)
+
+    def score_region(
+        self,
+        mask: np.ndarray,
+        class_names: Sequence[str],
+        positive_prompts: Dict[str, List[str]],
+        negative_prompts: Dict[str, List[str]],
+    ) -> RegionSemanticScores:
+        """Score one region with deterministic CLIP-like image/text features.
+
+        Args:
+            mask: Boolean region mask with shape [H, W].
+            class_names: Open-vocabulary classes with length C.
+            positive_prompts: Positive prompts, C classes by P prompts.
+            negative_prompts: Negative prompts, C classes by N prompts.
+
+        Returns:
+            Region semantic scores with shapes [C], [C, P], [C, N], and [C].
+        """
+
+        if self.dense_features is None:
+            raise SemanticBackendError("Fallback semantic backend was used before prepare_image().")
+
+        clip_prototype = pool_mask_features(self.dense_features, mask)
+        class_prompt_texts = [positive_prompts[class_name][0] for class_name in class_names]
+        positive_flat = flatten_prompt_dict(positive_prompts, class_names)
+        negative_flat = flatten_prompt_dict(negative_prompts, class_names)
+        num_positive_prompts = len(positive_prompts[class_names[0]])
+        num_negative_prompts = len(negative_prompts[class_names[0]])
+
+        base_scores = score_texts_against_vector(clip_prototype, class_prompt_texts)
+        positive_scores = score_texts_against_vector(clip_prototype, positive_flat).reshape(
+            len(class_names),
+            num_positive_prompts,
+        )
+        negative_scores = score_texts_against_vector(clip_prototype, negative_flat).reshape(
+            len(class_names),
+            num_negative_prompts,
+        )
+        prompt_rescore_scores = compute_prompt_rescore(
+            base_scores,
+            positive_scores,
+            negative_scores,
+            alpha=NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
+        )
+        return RegionSemanticScores(
+            base_scores=base_scores,
+            positive_scores=positive_scores,
+            negative_scores=negative_scores,
+            prompt_rescore_scores=prompt_rescore_scores,
+        )
+
+
+class OpenClipSemanticAdapter:
+    """Optional real CLIP semantic adapter backed by open_clip."""
+
+    description = "open_clip region crop image/text similarity"
+
+    def __init__(
+        self,
+        model_name: str = "ViT-B-32",
+        pretrained: str = "openai",
+        device: Optional[str] = None,
+        open_clip_module: Optional[Any] = None,
+    ) -> None:
+        """Load an open_clip model for region-level semantic scoring.
+
+        Args:
+            model_name: open_clip model name.
+            pretrained: open_clip pretrained weights tag.
+            device: Device string such as "cpu" or "cuda". Defaults to CUDA
+                when torch reports CUDA availability, otherwise CPU.
+            open_clip_module: Optional module-like object for tests.
+        """
+
+        self.device = device or self._default_device()
+        self.image: Optional[Image.Image] = None
+        self.image_array: Optional[np.ndarray] = None
+        if open_clip_module is None:
+            try:
+                import open_clip as open_clip_module  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise SemanticBackendError(
+                    "The CLIP semantic backend requires open_clip. Install optional dependencies with "
+                    "`pip install open_clip_torch` or `pip install -r requirements-clip.txt`."
+                ) from exc
+
+        self.open_clip = open_clip_module
+        try:
+            self.model, _, self.preprocess = self.open_clip.create_model_and_transforms(
+                model_name,
+                pretrained=pretrained,
+                device=self.device,
+            )
+            self.model.eval()
+            self.tokenizer = self.open_clip.get_tokenizer(model_name)
+        except Exception as exc:
+            raise SemanticBackendError(
+                "Failed to load open_clip model "
+                f"{model_name!r} with pretrained={pretrained!r} on device {self.device!r}. "
+                "open_clip may download weights to its normal user cache, not this repository; "
+                "check network access and installed torch/open_clip versions."
+            ) from exc
+
+    def _default_device(self) -> str:
+        """Choose CUDA when torch is installed and a GPU is visible."""
+
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    def prepare_image(self, image: Image.Image, image_array: np.ndarray) -> None:
+        """Store the image used for region crop scoring.
+
+        Args:
+            image: RGB PIL image.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+        """
+
+        self.image = image
+        self.image_array = image_array
+
+    def score_region(
+        self,
+        mask: np.ndarray,
+        class_names: Sequence[str],
+        positive_prompts: Dict[str, List[str]],
+        negative_prompts: Dict[str, List[str]],
+    ) -> RegionSemanticScores:
+        """Score one region crop against positive and negative CLIP prompts.
+
+        Args:
+            mask: Boolean region mask with shape [H, W].
+            class_names: Open-vocabulary classes with length C.
+            positive_prompts: Positive prompts, C classes by P prompts.
+            negative_prompts: Negative prompts, C classes by N prompts.
+
+        Returns:
+            Region semantic scores with shapes [C], [C, P], [C, N], and [C].
+        """
+
+        if self.image is None or self.image_array is None:
+            raise SemanticBackendError("CLIP semantic backend was used before prepare_image().")
+
+        crop = self._masked_region_crop(mask)
+        class_prompt_texts = [positive_prompts[class_name][0] for class_name in class_names]
+        positive_flat = flatten_prompt_dict(positive_prompts, class_names)
+        negative_flat = flatten_prompt_dict(negative_prompts, class_names)
+        num_positive_prompts = len(positive_prompts[class_names[0]])
+        num_negative_prompts = len(negative_prompts[class_names[0]])
+
+        try:
+            base_scores = self._score_prompts(crop, class_prompt_texts)
+            positive_scores = self._score_prompts(crop, positive_flat).reshape(
+                len(class_names),
+                num_positive_prompts,
+            )
+            negative_scores = self._score_prompts(crop, negative_flat).reshape(
+                len(class_names),
+                num_negative_prompts,
+            )
+        except Exception as exc:
+            raise SemanticBackendError(f"Failed to score a region with open_clip: {exc}") from exc
+
+        prompt_rescore_scores = compute_prompt_rescore(
+            base_scores,
+            positive_scores,
+            negative_scores,
+            alpha=NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
+        )
+        return RegionSemanticScores(
+            base_scores=base_scores,
+            positive_scores=positive_scores,
+            negative_scores=negative_scores,
+            prompt_rescore_scores=prompt_rescore_scores,
+        )
+
+    def _masked_region_crop(self, mask: np.ndarray) -> Image.Image:
+        """Crop the image around a mask and zero pixels outside the mask.
+
+        Args:
+            mask: Boolean region mask with shape [H, W].
+
+        Returns:
+            RGB PIL crop for CLIP image encoding.
+        """
+
+        if self.image is None or self.image_array is None:
+            raise SemanticBackendError("CLIP semantic backend has no prepared image.")
+
+        region_mask = np.asarray(mask, dtype=bool)
+        if region_mask.shape != self.image_array.shape[:2]:
+            raise SemanticBackendError(
+                f"CLIP region mask shape {region_mask.shape} does not match image shape {self.image_array.shape[:2]}."
+            )
+        if not bool(region_mask.any()):
+            return self.image.copy()
+
+        ys, xs = np.where(region_mask)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        crop_array = np.asarray(self.image.crop((x0, y0, x1, y1)), dtype=np.uint8).copy()
+        crop_mask = region_mask[y0:y1, x0:x1]
+        crop_array[~crop_mask] = 0
+        return Image.fromarray(crop_array, mode="RGB")
+
+    def _score_prompts(self, crop: Image.Image, prompts: Sequence[str]) -> np.ndarray:
+        """Score one image crop against a list of prompts using cosine similarity.
+
+        Args:
+            crop: RGB PIL image crop.
+            prompts: Prompt strings with length T.
+
+        Returns:
+            Similarity vector with shape [T].
+        """
+
+        with clip_inference_context():
+            image_tensor = self.preprocess(crop).unsqueeze(0).to(self.device)
+            token_tensor = self.tokenizer(list(prompts)).to(self.device)
+            image_features = self.model.encode_image(image_tensor)
+            text_features = self.model.encode_text(token_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            similarities = image_features @ text_features.T
+        return tensor_to_numpy(similarities).reshape(-1).astype(np.float32)
+
+
+def build_semantic_adapter(backend: str) -> Any:
+    """Build the requested semantic expert adapter.
+
+    Args:
+        backend: Semantic backend name, either "fallback" or "clip".
+
+    Returns:
+        Adapter object exposing prepare_image() and score_region().
+    """
+
+    if backend == "fallback":
+        return FallbackSemanticAdapter()
+    if backend == "clip":
+        return OpenClipSemanticAdapter()
+    raise ValueError(f"Unknown semantic backend {backend!r}; expected 'fallback' or 'clip'.")
+
+
 def compute_dino_region_scores(dino_features: np.ndarray, mask: np.ndarray, class_names: Sequence[str]) -> np.ndarray:
     """Score a DINO region prototype against deterministic class embeddings.
 
@@ -365,13 +702,19 @@ def save_label_png(segmentation: np.ndarray, output_path: Path, num_classes: int
     return label_path
 
 
-def run_inference(image_path: Path, class_names: Sequence[str], output_path: Path) -> Dict[str, Any]:
+def run_inference(
+    image_path: Path,
+    class_names: Sequence[str],
+    output_path: Path,
+    semantic_backend: str = "fallback",
+) -> Dict[str, Any]:
     """Run the UR-OVSS MVP loop and save visualization, mask, and JSON.
 
     Args:
         image_path: Input image path.
         class_names: Open-vocabulary classes with length C.
         output_path: PNG visualization path.
+        semantic_backend: Semantic expert backend, either "fallback" or "clip".
 
     Returns:
         Dictionary containing output paths and region debug records.
@@ -382,37 +725,21 @@ def run_inference(image_path: Path, class_names: Sequence[str], output_path: Pat
 
     positive_prompts = build_positive_prompts(class_names)
     negative_prompts = build_negative_prompts(class_names)
-    positive_flat = [prompt for class_name in class_names for prompt in positive_prompts[class_name]]
-    negative_flat = [prompt for class_name in class_names for prompt in negative_prompts[class_name]]
-
-    dense_features = build_dense_proxy_features(image_array)
-    class_prompt_texts = [positive_prompts[class_name][0] for class_name in class_names]
+    semantic_adapter = build_semantic_adapter(semantic_backend)
+    semantic_adapter.prepare_image(pil_image, image_array)
 
     height, width = image_array.shape[:2]
-    num_positive_prompts = len(next(iter(positive_prompts.values())))
-    num_negative_prompts = len(next(iter(negative_prompts.values())))
-
     masks = generate_fallback_masks(image_array)
     dino_features = build_patch_proxy_features(image_array)
 
     region_work: List[Dict[str, Any]] = []
     for region_id, mask_record in enumerate(masks):
         mask = mask_record["segmentation"]
-        clip_prototype = pool_mask_features(dense_features, mask)
-        base_scores = score_texts_against_vector(clip_prototype, class_prompt_texts)
-        positive_scores = score_texts_against_vector(clip_prototype, positive_flat).reshape(
-            len(class_names),
-            num_positive_prompts,
-        )
-        negative_scores = score_texts_against_vector(clip_prototype, negative_flat).reshape(
-            len(class_names),
-            num_negative_prompts,
-        )
-        prompt_rescore_scores = compute_prompt_rescore(
-            base_scores,
-            positive_scores,
-            negative_scores,
-            alpha=NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
+        semantic_scores = semantic_adapter.score_region(
+            mask,
+            class_names,
+            positive_prompts,
+            negative_prompts,
         )
         dino_scores = compute_dino_region_scores(dino_features, mask, class_names)
         region_work.append(
@@ -421,10 +748,10 @@ def run_inference(image_path: Path, class_names: Sequence[str], output_path: Pat
                 "mask": mask,
                 "area": int(mask.sum()),
                 "source": mask_record["source"],
-                "clip_prototype": clip_prototype,
-                "base_scores": base_scores,
-                "positive_scores": positive_scores,
-                "prompt_rescore_scores": prompt_rescore_scores,
+                "base_scores": semantic_scores.base_scores,
+                "positive_scores": semantic_scores.positive_scores,
+                "negative_scores": semantic_scores.negative_scores,
+                "prompt_rescore_scores": semantic_scores.prompt_rescore_scores,
                 "dino_scores": dino_scores,
                 "dino_variance": compute_dino_variance(dino_features, mask),
             }
@@ -452,6 +779,10 @@ def run_inference(image_path: Path, class_names: Sequence[str], output_path: Pat
         )
         routed["area"] = region["area"]
         routed["source"] = region["source"]
+        routed["base_scores"] = region["base_scores"].tolist()
+        routed["positive_scores"] = region["positive_scores"].tolist()
+        routed["negative_scores"] = region["negative_scores"].tolist()
+        routed["prompt_rescore_scores"] = region["prompt_rescore_scores"].tolist()
         fused_regions.append({**routed, "mask": region["mask"]})
         debug_regions.append(routed)
 
@@ -477,7 +808,7 @@ def run_inference(image_path: Path, class_names: Sequence[str], output_path: Pat
             "negative_prompt_suppression_alpha": NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
         },
         "experts": {
-            "semantic": "fallback dense proxy logits; replace with CLIP/ClearCLIP dense logits when available",
+            "semantic": semantic_adapter.description,
             "spatial": "fallback class-agnostic masks; replace with SAM AutomaticMaskGenerator when available",
             "purity": "fallback patch proxy features; replace with DINO features when available",
             "text": "template positive/negative prompts, no external LLM",
@@ -506,6 +837,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", required=True, type=Path, help="Path to an input image.")
     parser.add_argument("--classes", required=True, type=str, help='Comma-separated classes, e.g. "cat,dog,person".')
     parser.add_argument("--output", required=True, type=Path, help="Path for the output visualization PNG.")
+    parser.add_argument(
+        "--semantic-backend",
+        choices=("fallback", "clip"),
+        default="fallback",
+        help="Semantic expert backend. 'clip' requires optional open_clip dependencies and model access.",
+    )
     return parser
 
 
@@ -514,7 +851,10 @@ def main() -> None:
 
     args = build_arg_parser().parse_args()
     class_names = parse_class_names(args.classes)
-    result = run_inference(args.image, class_names, args.output)
+    try:
+        result = run_inference(args.image, class_names, args.output, semantic_backend=args.semantic_backend)
+    except SemanticBackendError as exc:
+        raise SystemExit(f"Semantic backend error: {exc}") from exc
     outputs = result["outputs"]
     print("UR-OVSS MVP inference complete.")
     print(f"Visualization: {outputs['visualization']}")
@@ -522,7 +862,10 @@ def main() -> None:
     print(f"Mask NPY: {outputs['mask_npy']}")
     print(f"Confidence NPY: {outputs['confidence_npy']}")
     print(f"Debug JSON: {outputs['debug_json']}")
-    print("Note: this empty repository used deterministic fallback experts, not real CLIP/SAM/DINO weights.")
+    if args.semantic_backend == "fallback":
+        print("Note: semantic backend used deterministic fallback features, not real CLIP weights.")
+    else:
+        print("Note: spatial masks and DINO purity still use deterministic fallback experts.")
 
 
 if __name__ == "__main__":
