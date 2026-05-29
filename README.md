@@ -50,6 +50,48 @@ python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car"
 
 DINOv2 weights are loaded by `transformers` into its normal user cache, not into this repository. If `transformers`, `torch`, model weights, or network/cache access are unavailable, the CLI exits with a clear feature backend error.
 
+## Pascal VOC Evaluation
+
+Pascal VOC 2012 semantic segmentation evaluation is available through `eval_pascal_voc.py`. It expects an existing VOC2012 directory and does not download the dataset:
+
+```bash
+python eval_pascal_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 10 --output-dir outputs/voc_eval
+```
+
+The evaluator reads image ids from `ImageSets/Segmentation/{split}.txt`, images from `JPEGImages`, and masks from `SegmentationClass`. It reports foreground-only mIoU over the 20 Pascal VOC classes and writes `metrics.json` to the output directory. Add `--save-vis` to keep per-image visualization PNGs; otherwise it avoids saving lots of demo images.
+
+The default fallback backends are useful for validating the evaluation pipeline, but they are not representative of real segmentation performance.
+
+## Real Backend VOC Smoke Test
+
+Use `scripts/run_voc_real_smoke.ps1` to run a small Pascal VOC validation smoke test with the real optional backends enabled: CLIP semantic scoring, SAM masks, and DINOv2 purity features.
+
+You need:
+
+- Pascal VOC 2012 dataset at `VOCdevkit/VOC2012`
+- A local SAM checkpoint such as `sam_vit_b.pth`
+- Dependencies from `requirements-clip.txt`
+- Dependencies from `requirements-sam.txt`
+- Dependencies from `requirements-dino.txt`
+
+Windows PowerShell example:
+
+```powershell
+$env:VOC_ROOT="C:\path\to\VOCdevkit\VOC2012"
+$env:SAM_CHECKPOINT="C:\path\to\sam_vit_b.pth"
+.\scripts\run_voc_real_smoke.ps1
+```
+
+Start with the default `LIMIT=1`. After that works, try `LIMIT=10`:
+
+```powershell
+$env:LIMIT="10"
+$env:OUTPUT_DIR="outputs/voc_real_smoke_limit10"
+.\scripts\run_voc_real_smoke.ps1
+```
+
+Full VOC val can be slow, especially with SAM and DINOv2, so a GPU is recommended. Do not commit `outputs`, Pascal VOC data, or SAM/model weights to the repository.
+
 The command saves:
 
 - `outputs/demo.png`: blended segmentation visualization
@@ -61,4 +103,4 @@ The command saves:
 Each `regions[]` entry in the JSON includes `region_id`, `predicted_label`, `semantic_margin`, `dino_variance`, `semantic_uncertain`, `spatial_uncertain`, `route_type`, and `confidence`.
 It also includes `base_scores`, `positive_scores`, `negative_scores`, and `prompt_rescore_scores` for debugging the selected semantic backend.
 
-No evaluation entry is included yet because this empty repository does not contain dataset or evaluation code.
+No dataset is included in this repository.
