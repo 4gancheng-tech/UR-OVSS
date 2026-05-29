@@ -46,6 +46,10 @@ class SemanticBackendError(RuntimeError):
     """Raised when a semantic expert backend cannot be initialized or used."""
 
 
+class MaskBackendError(RuntimeError):
+    """Raised when a mask generation backend cannot be initialized or used."""
+
+
 @dataclass
 class RegionSemanticScores:
     """Container for region-level semantic scores.
@@ -243,6 +247,200 @@ def generate_fallback_masks(image_array: np.ndarray) -> List[Dict[str, Any]]:
             masks.append({"segmentation": mask.astype(bool), "source": source})
 
     return masks
+
+
+class FallbackMaskAdapter:
+    """Deterministic class-agnostic mask adapter used by the default MVP path."""
+
+    description = "fallback class-agnostic masks"
+
+    def __init__(self, max_masks: Optional[int] = None) -> None:
+        """Initialize fallback mask generation.
+
+        Args:
+            max_masks: Optional maximum number of masks to keep.
+        """
+
+        self.max_masks = max_masks
+
+    def generate_masks(self, image: Image.Image, image_array: np.ndarray) -> List[Dict[str, Any]]:
+        """Generate fallback mask records compatible with SAM output.
+
+        Args:
+            image: RGB PIL image. Unused by this backend.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+
+        Returns:
+            List of mask dictionaries with bool `segmentation` arrays of shape
+            [H, W] and string `source` fields.
+        """
+
+        del image
+        masks = generate_fallback_masks(image_array)
+        if self.max_masks is not None:
+            masks = masks[: self.max_masks]
+        return masks
+
+
+class SamMaskAdapter:
+    """Optional SAM/MobileSAM class-agnostic mask adapter."""
+
+    description = "SAM/MobileSAM AutomaticMaskGenerator masks"
+
+    def __init__(
+        self,
+        checkpoint_path: Optional[Path],
+        model_type: str = "vit_b",
+        device: Optional[str] = None,
+        max_masks: Optional[int] = 100,
+        sam_module: Optional[Any] = None,
+    ) -> None:
+        """Load a SAM or MobileSAM automatic mask generator.
+
+        Args:
+            checkpoint_path: Path to SAM/MobileSAM checkpoint. Must be provided
+                by the user and is never downloaded into this repository.
+            model_type: SAM model type key, e.g. "vit_b".
+            device: Device string such as "cpu" or "cuda".
+            max_masks: Optional maximum number of masks to keep.
+            sam_module: Optional module-like object for tests.
+        """
+
+        if checkpoint_path is None:
+            raise MaskBackendError("--sam-checkpoint is required when --mask-backend sam is selected.")
+
+        self.checkpoint_path = Path(checkpoint_path)
+        if not self.checkpoint_path.exists():
+            raise MaskBackendError(f"SAM checkpoint does not exist: {self.checkpoint_path}")
+
+        self.model_type = model_type
+        self.device = device or self._default_device()
+        self.max_masks = max_masks
+        self.sam_module = sam_module or self._import_sam_module()
+        registry = getattr(self.sam_module, "sam_model_registry", None)
+        generator_cls = getattr(self.sam_module, "SamAutomaticMaskGenerator", None)
+        if registry is None or generator_cls is None:
+            raise MaskBackendError(
+                "SAM dependency does not expose sam_model_registry and SamAutomaticMaskGenerator."
+            )
+        if self.model_type not in registry:
+            available = ", ".join(sorted(registry.keys()))
+            raise MaskBackendError(f"Unknown SAM model type {self.model_type!r}. Available model types: {available}")
+
+        try:
+            model = registry[self.model_type](checkpoint=str(self.checkpoint_path))
+            if hasattr(model, "to"):
+                model = model.to(device=self.device)
+            if hasattr(model, "eval"):
+                model.eval()
+            self.generator = generator_cls(model)
+        except Exception as exc:
+            raise MaskBackendError(
+                "Failed to initialize SAM mask generator. Check that --sam-checkpoint matches "
+                f"--sam-model-type {self.model_type!r} and that SAM/MobileSAM dependencies are installed."
+            ) from exc
+
+    def _default_device(self) -> str:
+        """Choose CUDA when torch is installed and a GPU is visible."""
+
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+
+    def _import_sam_module(self) -> Any:
+        """Import segment_anything or mobile_sam with a clear error."""
+
+        try:
+            import segment_anything
+
+            return segment_anything
+        except ImportError as segment_error:
+            try:
+                import mobile_sam
+
+                return mobile_sam
+            except ImportError as mobile_error:
+                message = (
+                    "The SAM mask backend requires segment-anything or mobile-sam. "
+                    "Install optional dependencies with `pip install -r requirements-sam.txt`."
+                )
+                raise MaskBackendError(message) from mobile_error
+
+    def generate_masks(self, image: Image.Image, image_array: np.ndarray) -> List[Dict[str, Any]]:
+        """Generate SAM masks in the MVP-compatible mask record format.
+
+        Args:
+            image: RGB PIL image. Unused because SAM expects numpy RGB.
+            image_array: RGB image with shape [H, W, 3] and values in [0, 1].
+
+        Returns:
+            List of mask dictionaries with bool `segmentation` arrays of shape
+            [H, W] and string `source` fields.
+        """
+
+        del image
+        rgb_uint8 = (image_array * 255.0).clip(0, 255).astype(np.uint8)
+        try:
+            raw_masks = self.generator.generate(rgb_uint8)
+        except Exception as exc:
+            raise MaskBackendError(f"SAM mask generation failed: {exc}") from exc
+
+        masks: List[Dict[str, Any]] = []
+        for raw_mask in raw_masks:
+            if "segmentation" not in raw_mask:
+                continue
+            segmentation = np.asarray(raw_mask["segmentation"], dtype=bool)
+            if segmentation.shape != image_array.shape[:2]:
+                raise MaskBackendError(
+                    f"SAM mask shape {segmentation.shape} does not match image shape {image_array.shape[:2]}."
+                )
+            mask_record = dict(raw_mask)
+            mask_record["segmentation"] = segmentation
+            mask_record["source"] = f"sam_{self.model_type}"
+            masks.append(mask_record)
+            if self.max_masks is not None and len(masks) >= self.max_masks:
+                break
+        return masks
+
+
+def validate_max_masks(max_masks: Optional[int]) -> None:
+    """Validate that max_masks is absent or a positive integer."""
+
+    if max_masks is not None and max_masks <= 0:
+        raise MaskBackendError(f"--max-masks must be a positive integer, got {max_masks}.")
+
+
+def build_mask_adapter(
+    backend: str,
+    sam_checkpoint: Optional[Path] = None,
+    sam_model_type: str = "vit_b",
+    max_masks: Optional[int] = 100,
+) -> Any:
+    """Build the requested class-agnostic mask generation adapter.
+
+    Args:
+        backend: Mask backend name, either "fallback" or "sam".
+        sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
+        sam_model_type: SAM model type key.
+        max_masks: Optional maximum number of masks to keep.
+
+    Returns:
+        Adapter object exposing generate_masks().
+    """
+
+    validate_max_masks(max_masks)
+    if backend == "fallback":
+        return FallbackMaskAdapter(max_masks=max_masks)
+    if backend == "sam":
+        return SamMaskAdapter(
+            checkpoint_path=sam_checkpoint,
+            model_type=sam_model_type,
+            max_masks=max_masks,
+        )
+    raise ValueError(f"Unknown mask backend {backend!r}; expected 'fallback' or 'sam'.")
 
 
 def build_patch_proxy_features(image_array: np.ndarray) -> np.ndarray:
@@ -707,6 +905,10 @@ def run_inference(
     class_names: Sequence[str],
     output_path: Path,
     semantic_backend: str = "fallback",
+    mask_backend: str = "fallback",
+    sam_checkpoint: Optional[Path] = None,
+    sam_model_type: str = "vit_b",
+    max_masks: int = 100,
 ) -> Dict[str, Any]:
     """Run the UR-OVSS MVP loop and save visualization, mask, and JSON.
 
@@ -715,6 +917,10 @@ def run_inference(
         class_names: Open-vocabulary classes with length C.
         output_path: PNG visualization path.
         semantic_backend: Semantic expert backend, either "fallback" or "clip".
+        mask_backend: Mask backend, either "fallback" or "sam".
+        sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
+        sam_model_type: SAM model type key.
+        max_masks: Maximum number of masks to keep.
 
     Returns:
         Dictionary containing output paths and region debug records.
@@ -727,9 +933,17 @@ def run_inference(
     negative_prompts = build_negative_prompts(class_names)
     semantic_adapter = build_semantic_adapter(semantic_backend)
     semantic_adapter.prepare_image(pil_image, image_array)
+    mask_adapter = build_mask_adapter(
+        mask_backend,
+        sam_checkpoint=sam_checkpoint,
+        sam_model_type=sam_model_type,
+        max_masks=max_masks,
+    )
 
     height, width = image_array.shape[:2]
-    masks = generate_fallback_masks(image_array)
+    masks = mask_adapter.generate_masks(pil_image, image_array)
+    if not masks:
+        raise MaskBackendError(f"Mask backend {mask_backend!r} did not generate any mask.")
     dino_features = build_patch_proxy_features(image_array)
 
     region_work: List[Dict[str, Any]] = []
@@ -809,7 +1023,7 @@ def run_inference(
         },
         "experts": {
             "semantic": semantic_adapter.description,
-            "spatial": "fallback class-agnostic masks; replace with SAM AutomaticMaskGenerator when available",
+            "spatial": mask_adapter.description,
             "purity": "fallback patch proxy features; replace with DINO features when available",
             "text": "template positive/negative prompts, no external LLM",
         },
@@ -843,6 +1057,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="fallback",
         help="Semantic expert backend. 'clip' requires optional open_clip dependencies and model access.",
     )
+    parser.add_argument(
+        "--mask-backend",
+        choices=("fallback", "sam"),
+        default="fallback",
+        help="Class-agnostic mask backend. 'sam' requires optional SAM dependencies and --sam-checkpoint.",
+    )
+    parser.add_argument(
+        "--sam-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a SAM/MobileSAM checkpoint. Required when --mask-backend sam is selected.",
+    )
+    parser.add_argument(
+        "--sam-model-type",
+        default="vit_b",
+        help="SAM model type key used by sam_model_registry, e.g. vit_b.",
+    )
+    parser.add_argument(
+        "--max-masks",
+        type=int,
+        default=100,
+        help="Maximum number of candidate masks to keep from the selected mask backend.",
+    )
     return parser
 
 
@@ -852,9 +1089,20 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     class_names = parse_class_names(args.classes)
     try:
-        result = run_inference(args.image, class_names, args.output, semantic_backend=args.semantic_backend)
+        result = run_inference(
+            args.image,
+            class_names,
+            args.output,
+            semantic_backend=args.semantic_backend,
+            mask_backend=args.mask_backend,
+            sam_checkpoint=args.sam_checkpoint,
+            sam_model_type=args.sam_model_type,
+            max_masks=args.max_masks,
+        )
     except SemanticBackendError as exc:
         raise SystemExit(f"Semantic backend error: {exc}") from exc
+    except MaskBackendError as exc:
+        raise SystemExit(f"Mask backend error: {exc}") from exc
     outputs = result["outputs"]
     print("UR-OVSS MVP inference complete.")
     print(f"Visualization: {outputs['visualization']}")
@@ -865,7 +1113,9 @@ def main() -> None:
     if args.semantic_backend == "fallback":
         print("Note: semantic backend used deterministic fallback features, not real CLIP weights.")
     else:
-        print("Note: spatial masks and DINO purity still use deterministic fallback experts.")
+        print("Note: DINO purity still uses deterministic fallback features.")
+    if args.mask_backend == "fallback":
+        print("Note: mask backend used deterministic fallback masks, not real SAM masks.")
 
 
 if __name__ == "__main__":
