@@ -39,7 +39,7 @@ pip install -r requirements-sam.txt
 python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car" --output outputs/demo.png --mask-backend sam --sam-checkpoint path/to/sam_vit_b.pth --max-masks 100
 ```
 
-SAM/MobileSAM weights must be provided through `--sam-checkpoint`; they are not downloaded by this project and should not be committed to the repository. If `segment-anything` / `mobile-sam`, the checkpoint path, or model initialization is unavailable, the CLI exits with a clear mask backend error.
+SAM/MobileSAM weights must be provided through `--sam-checkpoint`; the inference CLI does not download them automatically, and they should not be committed to the repository. If `segment-anything` / `mobile-sam`, the checkpoint path, or model initialization is unavailable, the CLI exits with a clear mask backend error.
 
 To use the optional DINOv2 feature backend:
 
@@ -61,6 +61,61 @@ python eval_pascal_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --lim
 The evaluator reads image ids from `ImageSets/Segmentation/{split}.txt`, images from `JPEGImages`, and masks from `SegmentationClass`. It reports foreground-only mIoU over the 20 Pascal VOC classes and writes `metrics.json` to the output directory. Add `--save-vis` to keep per-image visualization PNGs; otherwise it avoids saving lots of demo images.
 
 The default fallback backends are useful for validating the evaluation pipeline, but they are not representative of real segmentation performance.
+
+## Preparing Real Backend Resources
+
+The real backend smoke test needs Pascal VOC 2012 segmentation data and a local SAM ViT-B checkpoint. Keep datasets, model weights, `outputs/`, and cache files outside GitHub commits.
+
+By default, the helper scripts use `D:\datasets` for datasets and `D:\models` for model weights. Override them with `DATASET_DIR` and `MODEL_DIR` if you prefer another location outside this repository.
+
+Download and validate Pascal VOC 2012:
+
+```powershell
+$env:DATASET_DIR="D:\datasets"
+.\scripts\download_voc2012.ps1
+```
+
+The script downloads `VOCtrainval_11-May-2012.tar`, extracts it to `DATASET_DIR\VOCdevkit\VOC2012`, checks `JPEGImages`, `SegmentationClass`, and `ImageSets\Segmentation\val.txt`, then prints a ready-to-use value:
+
+```powershell
+$env:VOC_ROOT="D:\datasets\VOCdevkit\VOC2012"
+```
+
+Download and validate the SAM ViT-B checkpoint:
+
+```powershell
+$env:MODEL_DIR="D:\models"
+.\scripts\download_sam_checkpoint.ps1
+```
+
+The script writes `sam_vit_b_01ec64.pth` to `MODEL_DIR`, never to the repository by default, then prints:
+
+```powershell
+$env:SAM_CHECKPOINT="D:\models\sam_vit_b_01ec64.pth"
+```
+
+Install the optional real-backend dependencies, set the printed environment variables in the same PowerShell session, and start with one VOC validation image:
+
+```powershell
+pip install -r requirements-clip.txt
+pip install -r requirements-sam.txt
+pip install -r requirements-dino.txt
+
+$env:VOC_ROOT="D:\datasets\VOCdevkit\VOC2012"
+$env:SAM_CHECKPOINT="D:\models\sam_vit_b_01ec64.pth"
+$env:LIMIT="1"
+.\scripts\run_voc_real_smoke.ps1
+```
+
+After `LIMIT=1` works, try `LIMIT=10`:
+
+```powershell
+$env:LIMIT="10"
+$env:OUTPUT_DIR="outputs/voc_real_smoke_limit10"
+.\scripts\run_voc_real_smoke.ps1
+```
+
+Full VOC val is much slower with CLIP, SAM, and DINOv2 enabled; a GPU is recommended before running the complete validation split.
 
 ## Real Backend VOC Smoke Test
 
