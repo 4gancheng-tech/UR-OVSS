@@ -1,5 +1,10 @@
 .venv/
 outputs/
+VOCdevkit/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
 __pycache__/
 .pytest_cache/
 .vs/
