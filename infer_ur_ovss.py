@@ -1117,32 +1117,25 @@ def save_label_png(segmentation: np.ndarray, output_path: Path, num_classes: int
     return label_path
 
 
-def run_inference(
+def run_inference_with_adapters(
     image_path: Path,
     class_names: Sequence[str],
     output_path: Path,
-    semantic_backend: str = "fallback",
-    mask_backend: str = "fallback",
-    feature_backend: str = "fallback",
-    dinov2_model: str = "facebook/dinov2-small",
-    sam_checkpoint: Optional[Path] = None,
-    sam_model_type: str = "vit_b",
-    max_masks: int = 100,
+    semantic_adapter: Any,
+    mask_adapter: Any,
+    feature_adapter: Any,
 ) -> Dict[str, Any]:
-    """Run the UR-OVSS MVP loop and save visualization, mask, and JSON.
+    """Run the UR-OVSS MVP loop with already initialized expert adapters.
 
     Args:
         image_path: Input image path.
         class_names: Open-vocabulary classes with length C.
         output_path: PNG visualization path.
-        semantic_backend: Semantic expert backend, either "fallback" or "clip".
-        mask_backend: Mask backend, either "fallback" or "sam".
-        feature_backend: Region-purity feature backend, either "fallback" or
-            "dinov2".
-        dinov2_model: DINOv2 model id or local path.
-        sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
-        sam_model_type: SAM model type key.
-        max_masks: Maximum number of masks to keep.
+        semantic_adapter: Prepared semantic backend object exposing
+            prepare_image() and score_region().
+        mask_adapter: Mask backend object exposing generate_masks().
+        feature_adapter: Region-purity backend object exposing
+            extract_features().
 
     Returns:
         Dictionary containing output paths and region debug records.
@@ -1153,20 +1146,13 @@ def run_inference(
 
     positive_prompts = build_positive_prompts(class_names)
     negative_prompts = build_negative_prompts(class_names)
-    semantic_adapter = build_semantic_adapter(semantic_backend)
     semantic_adapter.prepare_image(pil_image, image_array)
-    mask_adapter = build_mask_adapter(
-        mask_backend,
-        sam_checkpoint=sam_checkpoint,
-        sam_model_type=sam_model_type,
-        max_masks=max_masks,
-    )
-    feature_adapter = build_feature_adapter(feature_backend, dinov2_model=dinov2_model)
 
     height, width = image_array.shape[:2]
     masks = mask_adapter.generate_masks(pil_image, image_array)
     if not masks:
-        raise MaskBackendError(f"Mask backend {mask_backend!r} did not generate any mask.")
+        mask_description = getattr(mask_adapter, "description", mask_adapter.__class__.__name__)
+        raise MaskBackendError(f"Mask backend {mask_description!r} did not generate any mask.")
     dino_features = feature_adapter.extract_features(pil_image, image_array)
 
     region_work: List[Dict[str, Any]] = []
@@ -1265,6 +1251,55 @@ def run_inference(
         json.dump(debug_payload, handle, indent=2)
 
     return debug_payload
+
+
+def run_inference(
+    image_path: Path,
+    class_names: Sequence[str],
+    output_path: Path,
+    semantic_backend: str = "fallback",
+    mask_backend: str = "fallback",
+    feature_backend: str = "fallback",
+    dinov2_model: str = "facebook/dinov2-small",
+    sam_checkpoint: Optional[Path] = None,
+    sam_model_type: str = "vit_b",
+    max_masks: int = 100,
+) -> Dict[str, Any]:
+    """Build adapters, run one-image UR-OVSS inference, and save outputs.
+
+    Args:
+        image_path: Input image path.
+        class_names: Open-vocabulary classes with length C.
+        output_path: PNG visualization path.
+        semantic_backend: Semantic expert backend, either "fallback" or "clip".
+        mask_backend: Mask backend, either "fallback" or "sam".
+        feature_backend: Region-purity feature backend, either "fallback" or
+            "dinov2".
+        dinov2_model: DINOv2 model id or local path.
+        sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
+        sam_model_type: SAM model type key.
+        max_masks: Maximum number of masks to keep.
+
+    Returns:
+        Dictionary containing output paths and region debug records.
+    """
+
+    semantic_adapter = build_semantic_adapter(semantic_backend)
+    mask_adapter = build_mask_adapter(
+        mask_backend,
+        sam_checkpoint=sam_checkpoint,
+        sam_model_type=sam_model_type,
+        max_masks=max_masks,
+    )
+    feature_adapter = build_feature_adapter(feature_backend, dinov2_model=dinov2_model)
+    return run_inference_with_adapters(
+        image_path=image_path,
+        class_names=class_names,
+        output_path=output_path,
+        semantic_adapter=semantic_adapter,
+        mask_adapter=mask_adapter,
+        feature_adapter=feature_adapter,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

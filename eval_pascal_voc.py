@@ -10,7 +10,15 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 from PIL import Image
 
-from infer_ur_ovss import FeatureBackendError, MaskBackendError, SemanticBackendError, run_inference
+from infer_ur_ovss import (
+    FeatureBackendError,
+    MaskBackendError,
+    SemanticBackendError,
+    build_feature_adapter,
+    build_mask_adapter,
+    build_semantic_adapter,
+    run_inference_with_adapters,
+)
 
 
 VOC_CLASSES = [
@@ -174,9 +182,9 @@ def evaluate_dataset(
         split: Segmentation split name.
         output_dir: Directory where predictions and `metrics.json` are saved.
         limit: Optional maximum number of image ids to evaluate.
-        semantic_backend: Semantic backend passed to `run_inference`.
-        mask_backend: Mask backend passed to `run_inference`.
-        feature_backend: Feature backend passed to `run_inference`.
+        semantic_backend: Semantic backend used to build one reusable adapter.
+        mask_backend: Mask backend used to build one reusable adapter.
+        feature_backend: Feature backend used to build one reusable adapter.
         sam_checkpoint: Optional SAM checkpoint for the SAM mask backend.
         sam_model_type: SAM model type key.
         max_masks: Maximum number of masks to keep.
@@ -198,6 +206,16 @@ def evaluate_dataset(
     if limit is not None:
         image_ids = image_ids[:limit]
 
+    semantic_adapter = build_semantic_adapter(semantic_backend)
+    mask_adapter = build_mask_adapter(
+        mask_backend,
+        sam_checkpoint=sam_checkpoint,
+        sam_model_type=sam_model_type,
+        max_masks=max_masks,
+    )
+    feature_adapter = build_feature_adapter(feature_backend, dinov2_model=dinov2_model)
+    print("UR-OVSS backends are initialized once for this Pascal VOC evaluation run.")
+
     confusion = np.zeros((len(VOC_CLASSES) + 1, len(VOC_CLASSES) + 1), dtype=np.int64)
     evaluated_images = 0
     skipped_images = 0
@@ -218,17 +236,13 @@ def evaluate_dataset(
 
         image_output_dir = visualization_dir if save_vis else prediction_dir
         output_path = image_output_dir / f"{image_id}.png"
-        result = run_inference(
+        result = run_inference_with_adapters(
             image_path=image_path,
             class_names=VOC_CLASSES,
             output_path=output_path,
-            semantic_backend=semantic_backend,
-            mask_backend=mask_backend,
-            feature_backend=feature_backend,
-            sam_checkpoint=sam_checkpoint,
-            sam_model_type=sam_model_type,
-            max_masks=max_masks,
-            dinov2_model=dinov2_model,
+            semantic_adapter=semantic_adapter,
+            mask_adapter=mask_adapter,
+            feature_adapter=feature_adapter,
         )
         _remove_visualizations_if_disabled(result["outputs"], save_vis=save_vis)
 

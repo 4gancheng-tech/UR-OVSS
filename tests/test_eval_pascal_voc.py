@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+import eval_pascal_voc
 from eval_pascal_voc import (
     VOC_CLASSES,
     compute_confusion_matrix,
@@ -11,6 +12,33 @@ from eval_pascal_voc import (
     evaluate_dataset,
     map_prediction_to_voc_labels,
 )
+from infer_ur_ovss import RegionSemanticScores
+
+
+def _create_fake_voc_dataset(tmp_path, image_ids):
+    """Create a tiny Pascal VOC-like dataset for evaluation tests."""
+
+    voc_root = tmp_path / "VOC2012"
+    (voc_root / "ImageSets" / "Segmentation").mkdir(parents=True)
+    (voc_root / "JPEGImages").mkdir()
+    (voc_root / "SegmentationClass").mkdir()
+    (voc_root / "ImageSets" / "Segmentation" / "val.txt").write_text(
+        "\n".join(image_ids) + "\n",
+        encoding="utf-8",
+    )
+
+    for index, image_id in enumerate(image_ids):
+        image_array = np.zeros((16, 20, 3), dtype=np.uint8)
+        image_array[..., 0] = 64 + index
+        image_array[4:12, 6:16, 1] = 180
+        Image.fromarray(image_array, mode="RGB").save(voc_root / "JPEGImages" / f"{image_id}.jpg")
+
+        target = np.zeros((16, 20), dtype=np.uint8)
+        target[4:12, 6:16] = 1
+        target[0, 0] = 255
+        Image.fromarray(target).save(voc_root / "SegmentationClass" / f"{image_id}.png")
+
+    return voc_root
 
 
 def test_voc_class_list_contains_20_foreground_classes():
@@ -70,21 +98,7 @@ def test_iou_computation_returns_nan_for_absent_classes():
 def test_evaluate_dataset_runs_on_fake_voc_with_fallback_backend(tmp_path):
     """VOC evaluation should run end-to-end on a tiny fake dataset."""
 
-    voc_root = tmp_path / "VOC2012"
-    (voc_root / "ImageSets" / "Segmentation").mkdir(parents=True)
-    (voc_root / "JPEGImages").mkdir()
-    (voc_root / "SegmentationClass").mkdir()
-    (voc_root / "ImageSets" / "Segmentation" / "val.txt").write_text("fake_0001\n", encoding="utf-8")
-
-    image_array = np.zeros((16, 20, 3), dtype=np.uint8)
-    image_array[..., 0] = 64
-    image_array[4:12, 6:16, 1] = 180
-    Image.fromarray(image_array, mode="RGB").save(voc_root / "JPEGImages" / "fake_0001.jpg")
-
-    target = np.zeros((16, 20), dtype=np.uint8)
-    target[4:12, 6:16] = 1
-    target[0, 0] = 255
-    Image.fromarray(target).save(voc_root / "SegmentationClass" / "fake_0001.png")
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001"])
 
     output_dir = tmp_path / "voc_eval"
     metrics = evaluate_dataset(
@@ -103,5 +117,118 @@ def test_evaluate_dataset_runs_on_fake_voc_with_fallback_backend(tmp_path):
     assert len(metrics["per_class_iou"]) == 20
     assert Path(metrics["metrics_path"]).exists()
     saved_metrics = json.loads(Path(metrics["metrics_path"]).read_text(encoding="utf-8"))
+    assert set(saved_metrics) == {
+        "split",
+        "voc_root",
+        "mIoU",
+        "per_class_iou",
+        "evaluated_images",
+        "skipped_images",
+        "skipped",
+        "classes",
+        "metrics_path",
+    }
     assert saved_metrics["evaluated_images"] == 1
     assert not list((output_dir / "visualizations").glob("*.png"))
+
+
+def test_evaluate_dataset_initializes_backends_once_with_reusable_adapters(monkeypatch, tmp_path):
+    """VOC evaluation should reuse initialized adapters across images."""
+
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001", "fake_0002"])
+    init_counts = {"semantic": 0, "mask": 0, "feature": 0}
+
+    class CountingSemanticAdapter:
+        """Fake semantic adapter that records construction count."""
+
+        description = "counting semantic"
+
+        def __init__(self):
+            init_counts["semantic"] += 1
+
+        def prepare_image(self, image, image_array):
+            """Accept per-image preparation without loading a model."""
+
+            del image, image_array
+
+        def score_region(self, mask, class_names, positive_prompts, negative_prompts):
+            """Return deterministic region scores with the expected shapes."""
+
+            del mask
+            base_scores = np.linspace(1.0, 0.0, len(class_names), dtype=np.float32)
+            positive_scores = np.repeat(
+                base_scores[:, None],
+                len(positive_prompts[class_names[0]]),
+                axis=1,
+            )
+            negative_scores = np.zeros(
+                (len(class_names), len(negative_prompts[class_names[0]])),
+                dtype=np.float32,
+            )
+            return RegionSemanticScores(
+                base_scores=base_scores,
+                positive_scores=positive_scores,
+                negative_scores=negative_scores,
+                prompt_rescore_scores=base_scores,
+            )
+
+    class CountingMaskAdapter:
+        """Fake mask adapter that records construction count."""
+
+        description = "counting masks"
+
+        def __init__(self):
+            init_counts["mask"] += 1
+
+        def generate_masks(self, image, image_array):
+            """Return one full-image mask per input image."""
+
+            del image
+            return [
+                {
+                    "segmentation": np.ones(image_array.shape[:2], dtype=bool),
+                    "source": "counting_mask",
+                }
+            ]
+
+    class CountingFeatureAdapter:
+        """Fake feature adapter that records construction count."""
+
+        description = "counting features"
+
+        def __init__(self):
+            init_counts["feature"] += 1
+
+        def extract_features(self, image, image_array):
+            """Return a normalized dense feature map with shape [H, W, D]."""
+
+            del image
+            features = np.ones((*image_array.shape[:2], 4), dtype=np.float32)
+            return features / np.linalg.norm(features, axis=-1, keepdims=True)
+
+    monkeypatch.setattr(eval_pascal_voc, "build_semantic_adapter", lambda backend: CountingSemanticAdapter())
+    monkeypatch.setattr(
+        eval_pascal_voc,
+        "build_mask_adapter",
+        lambda backend, sam_checkpoint=None, sam_model_type="vit_b", max_masks=100: CountingMaskAdapter(),
+    )
+    monkeypatch.setattr(
+        eval_pascal_voc,
+        "build_feature_adapter",
+        lambda feature_backend, dinov2_model="facebook/dinov2-small": CountingFeatureAdapter(),
+    )
+
+    output_dir = tmp_path / "voc_eval_reuse"
+    metrics = evaluate_dataset(
+        voc_root=voc_root,
+        split="val",
+        output_dir=output_dir,
+        limit=2,
+        semantic_backend="fallback",
+        mask_backend="fallback",
+        feature_backend="fallback",
+        save_vis=False,
+    )
+
+    assert metrics["evaluated_images"] == 2
+    assert init_counts == {"semantic": 1, "mask": 1, "feature": 1}
