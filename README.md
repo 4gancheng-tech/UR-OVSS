@@ -62,6 +62,16 @@ The evaluator reads image ids from `ImageSets/Segmentation/{split}.txt`, images 
 
 The default fallback backends are useful for validating the evaluation pipeline, but they are not representative of real segmentation performance.
 
+## VOC Evaluation Diagnostics
+
+After running `eval_pascal_voc.py`, use `analyze_voc_outputs.py` to inspect failure modes from the saved prediction arrays, per-image debug JSON, and Pascal VOC GT masks:
+
+```bash
+python analyze_voc_outputs.py --eval-dir outputs/voc_real_fullval --voc-root path/to/VOCdevkit/VOC2012 --output-json outputs/voc_real_fullval/diagnostics.json
+```
+
+The diagnostics script does not read or save large image files. It reports per-image foreground IoU, foreground pixel ratios, class distributions, region counts, average confidence, uncertainty counts, route-type counts, and summary rankings such as worst/best images, foreground over- or under-prediction, most predicted classes, most missed GT classes, and global route-type distribution.
+
 ## Preparing Real Backend Resources
 
 The real backend smoke test needs Pascal VOC 2012 segmentation data and a local SAM ViT-B checkpoint. Keep datasets, model weights, `outputs/`, and cache files outside GitHub commits.
