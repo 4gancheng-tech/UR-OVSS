@@ -27,6 +27,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only in missing-dependency environments.
     raise SystemExit("UR-OVSS MVP requires Pillow for image I/O. Install it with: pip install pillow") from exc
 
+from clearclip_backend import ClearClipSemanticAdapter
 from prompts import build_negative_prompts, build_positive_prompts, compute_prompt_rescore
 from uncertainty_routing import (
     compute_dino_variance,
@@ -1020,7 +1021,7 @@ def build_semantic_adapter(backend: str) -> Any:
     """Build the requested semantic expert adapter.
 
     Args:
-        backend: Semantic backend name, either "fallback" or "clip".
+        backend: Semantic backend name, "fallback", "clip", or "clearclip".
 
     Returns:
         Adapter object exposing prepare_image() and score_region().
@@ -1030,7 +1031,13 @@ def build_semantic_adapter(backend: str) -> Any:
         return FallbackSemanticAdapter()
     if backend == "clip":
         return OpenClipSemanticAdapter()
-    raise ValueError(f"Unknown semantic backend {backend!r}; expected 'fallback' or 'clip'.")
+    if backend == "clearclip":
+        return ClearClipSemanticAdapter(
+            backend_error_cls=SemanticBackendError,
+            score_cls=RegionSemanticScores,
+            alpha=NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
+        )
+    raise ValueError(f"Unknown semantic backend {backend!r}; expected 'fallback', 'clip', or 'clearclip'.")
 
 
 def compute_dino_region_scores(dino_features: np.ndarray, mask: np.ndarray, class_names: Sequence[str]) -> np.ndarray:
@@ -1117,6 +1124,41 @@ def save_label_png(segmentation: np.ndarray, output_path: Path, num_classes: int
     return label_path
 
 
+def apply_background_filter(
+    routed_region: Dict[str, Any],
+    background_threshold: float,
+    background_margin_threshold: float,
+) -> bool:
+    """Mark whether a routed region should be excluded as background.
+
+    Args:
+        routed_region: Region debug record returned by route_region().
+        background_threshold: Minimum region confidence required for foreground
+            fusion.
+        background_margin_threshold: Minimum semantic margin required for
+            foreground fusion.
+
+    Returns:
+        True when the region should be filtered out before pixel fusion.
+    """
+
+    reasons = []
+    confidence = float(routed_region["confidence"])
+    semantic_margin = float(routed_region["semantic_margin"])
+    if confidence < background_threshold:
+        reasons.append(f"confidence {confidence:.6f} < background_threshold {background_threshold:.6f}")
+    if semantic_margin < background_margin_threshold:
+        reasons.append(
+            f"semantic_margin {semantic_margin:.6f} < background_margin_threshold "
+            f"{background_margin_threshold:.6f}"
+        )
+
+    filtered = bool(reasons)
+    routed_region["filtered_as_background"] = filtered
+    routed_region["background_filter_reason"] = "; ".join(reasons) if filtered else None
+    return filtered
+
+
 def run_inference_with_adapters(
     image_path: Path,
     class_names: Sequence[str],
@@ -1124,6 +1166,8 @@ def run_inference_with_adapters(
     semantic_adapter: Any,
     mask_adapter: Any,
     feature_adapter: Any,
+    background_threshold: float = 0.0,
+    background_margin_threshold: float = 0.0,
 ) -> Dict[str, Any]:
     """Run the UR-OVSS MVP loop with already initialized expert adapters.
 
@@ -1136,6 +1180,9 @@ def run_inference_with_adapters(
         mask_adapter: Mask backend object exposing generate_masks().
         feature_adapter: Region-purity backend object exposing
             extract_features().
+        background_threshold: Minimum region confidence for foreground fusion.
+        background_margin_threshold: Minimum semantic margin for foreground
+            fusion.
 
     Returns:
         Dictionary containing output paths and region debug records.
@@ -1206,7 +1253,13 @@ def run_inference_with_adapters(
         routed["positive_scores"] = region["positive_scores"].tolist()
         routed["negative_scores"] = region["negative_scores"].tolist()
         routed["prompt_rescore_scores"] = region["prompt_rescore_scores"].tolist()
-        fused_regions.append({**routed, "mask": region["mask"]})
+        filtered_as_background = apply_background_filter(
+            routed,
+            background_threshold=background_threshold,
+            background_margin_threshold=background_margin_threshold,
+        )
+        if not filtered_as_background:
+            fused_regions.append({**routed, "mask": region["mask"]})
         debug_regions.append(routed)
 
     segmentation, confidence_map = fuse_region_predictions(fused_regions, output_shape=(height, width))
@@ -1229,6 +1282,8 @@ def run_inference_with_adapters(
             "rho_sem": RHO_SEM,
             "rho_spa": RHO_SPA,
             "negative_prompt_suppression_alpha": NEGATIVE_PROMPT_SUPPRESSION_ALPHA,
+            "background_threshold": background_threshold,
+            "background_margin_threshold": background_margin_threshold,
         },
         "experts": {
             "semantic": semantic_adapter.description,
@@ -1264,6 +1319,8 @@ def run_inference(
     sam_checkpoint: Optional[Path] = None,
     sam_model_type: str = "vit_b",
     max_masks: int = 100,
+    background_threshold: float = 0.0,
+    background_margin_threshold: float = 0.0,
 ) -> Dict[str, Any]:
     """Build adapters, run one-image UR-OVSS inference, and save outputs.
 
@@ -1279,6 +1336,9 @@ def run_inference(
         sam_checkpoint: Optional SAM checkpoint path for the "sam" backend.
         sam_model_type: SAM model type key.
         max_masks: Maximum number of masks to keep.
+        background_threshold: Minimum region confidence for foreground fusion.
+        background_margin_threshold: Minimum semantic margin for foreground
+            fusion.
 
     Returns:
         Dictionary containing output paths and region debug records.
@@ -1299,6 +1359,8 @@ def run_inference(
         semantic_adapter=semantic_adapter,
         mask_adapter=mask_adapter,
         feature_adapter=feature_adapter,
+        background_threshold=background_threshold,
+        background_margin_threshold=background_margin_threshold,
     )
 
 
@@ -1311,9 +1373,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path, help="Path for the output visualization PNG.")
     parser.add_argument(
         "--semantic-backend",
-        choices=("fallback", "clip"),
+        choices=("fallback", "clip", "clearclip"),
         default="fallback",
-        help="Semantic expert backend. 'clip' requires optional open_clip dependencies and model access.",
+        help=(
+            "Semantic expert backend. 'clip' uses crop-level CLIP scoring; "
+            "'clearclip' uses dense patch-level open_clip scoring."
+        ),
     )
     parser.add_argument(
         "--mask-backend",
@@ -1349,6 +1414,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=100,
         help="Maximum number of candidate masks to keep from the selected mask backend.",
     )
+    parser.add_argument(
+        "--background-threshold",
+        type=float,
+        default=0.0,
+        help="Filter regions below this confidence before foreground fusion. Default 0.0 keeps old behavior.",
+    )
+    parser.add_argument(
+        "--background-margin-threshold",
+        type=float,
+        default=0.0,
+        help="Filter regions below this semantic margin before foreground fusion. Default 0.0 keeps old behavior.",
+    )
     return parser
 
 
@@ -1369,6 +1446,8 @@ def main() -> None:
             sam_checkpoint=args.sam_checkpoint,
             sam_model_type=args.sam_model_type,
             max_masks=args.max_masks,
+            background_threshold=args.background_threshold,
+            background_margin_threshold=args.background_margin_threshold,
         )
     except SemanticBackendError as exc:
         raise SystemExit(f"Semantic backend error: {exc}") from exc

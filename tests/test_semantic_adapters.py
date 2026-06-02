@@ -10,10 +10,13 @@ from infer_ur_ovss import (
     OpenClipSemanticAdapter,
     SemanticBackendError,
     build_semantic_adapter,
+    build_arg_parser,
     clip_inference_context,
     parse_class_names,
     run_inference,
 )
+import infer_ur_ovss
+from clearclip_backend import ClearClipSemanticAdapter
 from prompts import build_negative_prompts, build_positive_prompts
 
 
@@ -39,6 +42,48 @@ def test_build_semantic_adapter_returns_fallback_backend():
     adapter = build_semantic_adapter("fallback")
 
     assert isinstance(adapter, FallbackSemanticAdapter)
+
+
+def test_inference_parser_accepts_clearclip_semantic_backend():
+    """The single-image CLI should accept the ClearCLIP semantic backend."""
+
+    parser = build_arg_parser()
+
+    args = parser.parse_args(
+        [
+            "--image",
+            "input.jpg",
+            "--classes",
+            "cat,dog",
+            "--output",
+            "out.png",
+            "--semantic-backend",
+            "clearclip",
+        ]
+    )
+
+    assert args.semantic_backend == "clearclip"
+
+
+def test_build_semantic_adapter_returns_clearclip_backend(monkeypatch):
+    """Semantic backend selection should expose the ClearCLIP adapter."""
+
+    calls = []
+
+    class FakeClearClipAdapter:
+        """Small adapter stand-in for backend selection."""
+
+        def __init__(self, *args, **kwargs):
+            """Record construction arguments."""
+
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr(infer_ur_ovss, "ClearClipSemanticAdapter", FakeClearClipAdapter)
+
+    adapter = build_semantic_adapter("clearclip")
+
+    assert isinstance(adapter, FakeClearClipAdapter)
+    assert calls
 
 
 def test_build_semantic_adapter_rejects_unknown_backend():
@@ -228,6 +273,62 @@ def test_open_clip_semantic_adapter_scores_region_shapes_with_fake_module():
 
     scores = adapter.score_region(mask, class_names, positive_prompts, negative_prompts)
 
+    assert scores.base_scores.shape == (3,)
+    assert scores.positive_scores.shape == (3, 5)
+    assert scores.negative_scores.shape == (3, 2)
+    assert scores.prompt_rescore_scores.shape == (3,)
+
+
+class FakeClearClipModule:
+    """Small open_clip stand-in for ClearCLIP dense adapter tests."""
+
+    @staticmethod
+    def create_model_and_transforms(model_name, pretrained, device):
+        """Return a fake dense CLIP model and preprocess function."""
+
+        return FakeClearClipModel(), None, FakePreprocess()
+
+    @staticmethod
+    def get_tokenizer(model_name):
+        """Return a tokenizer that tracks prompt count."""
+
+        return lambda prompts: FakeTokenBatch(len(prompts))
+
+
+class FakeClearClipModel(FakeClipModel):
+    """Fake CLIP model exposing image patch features."""
+
+    def encode_dense_image(self, image_tensor):
+        """Return one 2x2 dense feature grid with shape [1, H, W, D]."""
+
+        del image_tensor
+        dense = np.array(
+            [
+                [
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 0.0, 1.0], [1.0, 1.0, 0.0]],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        return FakeTensor(dense)
+
+
+def test_clearclip_semantic_adapter_outputs_dense_logits_and_region_shapes():
+    """ClearCLIP adapter should pool image-sized dense logits over regions."""
+
+    image, image_array = _small_rgb_image()
+    class_names = ["cat", "dog", "car"]
+    positive_prompts, negative_prompts = _prompt_sets(class_names)
+    mask = np.zeros(image_array.shape[:2], dtype=bool)
+    mask[:4, :5] = True
+    adapter = ClearClipSemanticAdapter(open_clip_module=FakeClearClipModule(), device="cpu")
+    adapter.prepare_image(image, image_array)
+
+    dense_logits = adapter.dense_logits_for_prompts([positive_prompts[class_names[0]][0]])
+    scores = adapter.score_region(mask, class_names, positive_prompts, negative_prompts)
+
+    assert dense_logits.shape == (8, 10, 1)
     assert scores.base_scores.shape == (3,)
     assert scores.positive_scores.shape == (3, 5)
     assert scores.negative_scores.shape == (3, 2)
