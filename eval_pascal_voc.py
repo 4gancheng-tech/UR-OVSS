@@ -43,6 +43,7 @@ VOC_CLASSES = [
     "train",
     "tvmonitor",
 ]
+VOC21_CLASSES = ["background", *VOC_CLASSES]
 
 
 def read_split_ids(voc_root: Path, split: str) -> List[str]:
@@ -144,6 +145,80 @@ def compute_iou_from_confusion(confusion: np.ndarray) -> np.ndarray:
     return iou
 
 
+def compute_voc_confusion_matrix(
+    pred: np.ndarray,
+    target: np.ndarray,
+    voc_mode: str = "voc20",
+    ignore_index: int = 255,
+    voc20_ignore_background: bool = False,
+) -> np.ndarray:
+    """Compute Pascal VOC confusion with explicit VOC20/VOC21 handling.
+
+    Args:
+        pred: UR-OVSS label map with shape [H, W], using -1 for unassigned
+            and 0-19 for VOC foreground classes.
+        target: Pascal VOC GT labels with shape [H, W], where 0 is background,
+            1-20 are foreground classes, and 255 is ignore.
+        voc_mode: "voc20" computes foreground-only mIoU. "voc21" includes
+            background in the final mIoU.
+        ignore_index: Target label ignored during evaluation.
+        voc20_ignore_background: In VOC20 mode, optionally convert GT
+            background label 0 to ignore. Defaults false to preserve the
+            historical evaluator behavior.
+
+    Returns:
+        Confusion matrix with shape [21, 21], rows as GT and columns as
+        predictions.
+    """
+
+    if voc_mode not in {"voc20", "voc21"}:
+        raise ValueError(f"voc_mode must be 'voc20' or 'voc21', got {voc_mode!r}.")
+
+    pred_voc = map_prediction_to_voc_labels(pred)
+    target_eval = np.asarray(target, dtype=np.int64).copy()
+    if voc_mode == "voc20" and voc20_ignore_background:
+        target_eval[target_eval == 0] = ignore_index
+    return compute_confusion_matrix(pred_voc, target_eval, num_classes=len(VOC_CLASSES) + 1, ignore_index=ignore_index)
+
+
+def summarize_voc_metrics(confusion: np.ndarray, voc_mode: str = "voc20") -> Dict[str, Any]:
+    """Summarize Pascal VOC IoU metrics for VOC20 or VOC21 mode.
+
+    Args:
+        confusion: Confusion matrix with shape [21, 21].
+        voc_mode: "voc20" reports only foreground class IoUs in mIoU.
+            "voc21" reports background plus foreground classes in mIoU.
+
+    Returns:
+        Dictionary with `mIoU`, `per_class_iou`, `classes`, and
+        `background_iou`.
+    """
+
+    if voc_mode not in {"voc20", "voc21"}:
+        raise ValueError(f"voc_mode must be 'voc20' or 'voc21', got {voc_mode!r}.")
+
+    per_label_iou = compute_iou_from_confusion(confusion)
+    background_iou = None if np.isnan(per_label_iou[0]) else float(per_label_iou[0])
+    if voc_mode == "voc21":
+        selected_iou = per_label_iou
+        class_names = VOC21_CLASSES
+    else:
+        selected_iou = per_label_iou[1:]
+        class_names = VOC_CLASSES
+
+    miou = float(np.nanmean(selected_iou)) if not np.all(np.isnan(selected_iou)) else float("nan")
+    per_class_iou = {
+        class_name: (None if np.isnan(iou) else float(iou))
+        for class_name, iou in zip(class_names, selected_iou)
+    }
+    return {
+        "mIoU": miou,
+        "per_class_iou": per_class_iou,
+        "classes": class_names,
+        "background_iou": background_iou if voc_mode == "voc21" else None,
+    }
+
+
 def _load_target_mask(path: Path) -> np.ndarray:
     """Load a Pascal VOC segmentation mask as an integer numpy array."""
 
@@ -174,6 +249,10 @@ def evaluate_dataset(
     max_masks: int = 100,
     dinov2_model: str = "facebook/dinov2-small",
     save_vis: bool = False,
+    background_threshold: float = 0.0,
+    background_margin_threshold: float = 0.0,
+    voc_mode: str = "voc20",
+    voc20_ignore_background: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate UR-OVSS on Pascal VOC 2012 semantic segmentation.
 
@@ -190,6 +269,14 @@ def evaluate_dataset(
         max_masks: Maximum number of masks to keep.
         dinov2_model: DINOv2 model id or local path.
         save_vis: Whether to keep per-image visualization PNGs.
+        background_threshold: Minimum region confidence for foreground fusion.
+        background_margin_threshold: Minimum semantic margin for foreground
+            fusion.
+        voc_mode: "voc20" keeps foreground-only mIoU; "voc21" includes
+            background in the mIoU.
+        voc20_ignore_background: In VOC20 mode, ignore GT background pixels
+            instead of counting foreground predictions on background as false
+            positives. Defaults false to preserve historical results.
 
     Returns:
         Metrics dictionary also written to `metrics.json`.
@@ -243,13 +330,19 @@ def evaluate_dataset(
             semantic_adapter=semantic_adapter,
             mask_adapter=mask_adapter,
             feature_adapter=feature_adapter,
+            background_threshold=background_threshold,
+            background_margin_threshold=background_margin_threshold,
         )
         _remove_visualizations_if_disabled(result["outputs"], save_vis=save_vis)
 
         pred_raw = np.load(result["outputs"]["mask_npy"])
-        pred_voc = map_prediction_to_voc_labels(pred_raw)
         target = _load_target_mask(target_path)
-        confusion += compute_confusion_matrix(pred_voc, target, num_classes=len(VOC_CLASSES) + 1, ignore_index=255)
+        confusion += compute_voc_confusion_matrix(
+            pred_raw,
+            target,
+            voc_mode=voc_mode,
+            voc20_ignore_background=voc20_ignore_background,
+        )
         evaluated_images += 1
 
     if evaluated_images == 0:
@@ -259,24 +352,23 @@ def evaluate_dataset(
             f"Skipped {skipped_images} image(s); check --voc-root, --split, and dataset files.{first_skip}"
         )
 
-    per_label_iou = compute_iou_from_confusion(confusion)
-    foreground_iou = per_label_iou[1:]
-    miou = float(np.nanmean(foreground_iou)) if not np.all(np.isnan(foreground_iou)) else float("nan")
-    per_class_iou = {
-        class_name: (None if np.isnan(iou) else float(iou))
-        for class_name, iou in zip(VOC_CLASSES, foreground_iou)
-    }
+    summarized = summarize_voc_metrics(confusion, voc_mode=voc_mode)
+    miou = summarized["mIoU"]
+    per_class_iou = summarized["per_class_iou"]
 
     metrics_path = output_dir / "metrics.json"
     metrics: Dict[str, Any] = {
         "split": split,
         "voc_root": str(voc_root),
+        "voc_mode": voc_mode,
+        "voc20_ignore_background": bool(voc20_ignore_background),
+        "background_iou": summarized["background_iou"],
         "mIoU": miou,
         "per_class_iou": per_class_iou,
         "evaluated_images": evaluated_images,
         "skipped_images": skipped_images,
         "skipped": skipped,
-        "classes": VOC_CLASSES,
+        "classes": summarized["classes"],
         "metrics_path": str(metrics_path),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -291,7 +383,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default="val", help="VOC segmentation split name.")
     parser.add_argument("--output-dir", default=Path("outputs/voc_eval"), type=Path, help="Evaluation output dir.")
     parser.add_argument("--limit", default=None, type=int, help="Optional maximum number of images to evaluate.")
-    parser.add_argument("--semantic-backend", choices=("fallback", "clip"), default="fallback")
+    parser.add_argument(
+        "--voc-mode",
+        choices=("voc20", "voc21"),
+        default="voc20",
+        help=(
+            "VOC evaluation mode. voc20 reports foreground-only mIoU and keeps GT background as valid "
+            "false-positive area by default; voc21 includes background in mIoU."
+        ),
+    )
+    parser.add_argument(
+        "--voc20-ignore-background",
+        action="store_true",
+        help="In voc20 mode, ignore GT background pixels. This is off by default to preserve old results.",
+    )
+    parser.add_argument("--semantic-backend", choices=("fallback", "clip", "clearclip"), default="fallback")
     parser.add_argument("--mask-backend", choices=("fallback", "sam"), default="fallback")
     parser.add_argument("--feature-backend", choices=("fallback", "dinov2"), default="fallback")
     parser.add_argument("--sam-checkpoint", default=None, type=Path)
@@ -299,6 +405,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-masks", default=100, type=int)
     parser.add_argument("--dinov2-model", default="facebook/dinov2-small")
     parser.add_argument("--save-vis", action="store_true", help="Keep per-image visualization PNGs.")
+    parser.add_argument(
+        "--background-threshold",
+        default=0.0,
+        type=float,
+        help="Filter regions below this confidence before foreground fusion. Default 0.0 keeps old behavior.",
+    )
+    parser.add_argument(
+        "--background-margin-threshold",
+        default=0.0,
+        type=float,
+        help="Filter regions below this semantic margin before foreground fusion. Default 0.0 keeps old behavior.",
+    )
     return parser
 
 
@@ -320,6 +438,10 @@ def main() -> None:
             max_masks=args.max_masks,
             dinov2_model=args.dinov2_model,
             save_vis=args.save_vis,
+            background_threshold=args.background_threshold,
+            background_margin_threshold=args.background_margin_threshold,
+            voc_mode=args.voc_mode,
+            voc20_ignore_background=args.voc20_ignore_background,
         )
     except (FileNotFoundError, ValueError, RuntimeError, SemanticBackendError, MaskBackendError, FeatureBackendError) as exc:
         raise SystemExit(f"Pascal VOC evaluation error: {exc}") from exc
@@ -327,6 +449,11 @@ def main() -> None:
     print(f"Evaluated images: {metrics['evaluated_images']}")
     print(f"Skipped images: {metrics['skipped_images']}")
     print(f"mIoU: {metrics['mIoU']:.6f}")
+    print(f"VOC mode: {metrics['voc_mode']}")
+    if metrics["voc_mode"] == "voc20":
+        print(f"VOC20 ignore background: {metrics['voc20_ignore_background']}")
+    if metrics["background_iou"] is not None:
+        print(f"Background IoU: {metrics['background_iou']:.6f}")
     print(f"Metrics JSON: {metrics['metrics_path']}")
     print("Per-class IoU:")
     for class_name, iou in metrics["per_class_iou"].items():

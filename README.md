@@ -6,6 +6,7 @@ This repository keeps DINO purity as a deterministic fallback expert. Semantic a
 
 - `fallback`: deterministic dense proxy logits, no model download
 - `clip`: optional real CLIP region-crop scoring through `open_clip`
+- `clearclip`: optional ClearCLIP-style dense patch-level scoring through `open_clip`
 - `--mask-backend fallback`: deterministic class-agnostic fallback masks, the default option
 - `--mask-backend sam`: optional SAM/MobileSAM class-agnostic masks from a user-provided checkpoint
 - `--feature-backend fallback`: deterministic patch-level proxy features for region purity
@@ -14,7 +15,7 @@ This repository keeps DINO purity as a deterministic fallback expert. Semantic a
 
 DINOv2 is used only for region purity / spatial uncertainty. It is not used for class prediction.
 
-The current `clip` backend is region crop-level CLIP scoring. It is not dense CLIP or ClearCLIP logits.
+The current `clip` backend is region crop-level CLIP scoring. The `clearclip` backend is the dense semantic path: it computes image-sized patch-level CLIP score maps and pools those logits over SAM regions.
 
 ## Run
 
@@ -31,6 +32,15 @@ python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car"
 ```
 
 CLIP weights are loaded by `open_clip` into its normal user cache, not into this repository. If `open_clip`, `torch`, the model weights, or network access are unavailable, the CLI exits with a clear semantic backend error.
+
+To use the optional ClearCLIP-style dense semantic backend:
+
+```bash
+pip install -r requirements-clip.txt
+python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car" --output outputs/demo.png --semantic-backend clearclip
+```
+
+This backend currently uses a minimal ViT-B/16 dense patch-logit adapter inspired by the official ClearCLIP implementation. It does not vendor official ClearCLIP code or weights; see `docs/clearclip_integration_plan.md` for integration scope and attribution.
 
 To use the optional SAM mask backend:
 
@@ -62,6 +72,16 @@ The evaluator reads image ids from `ImageSets/Segmentation/{split}.txt`, images 
 
 The default fallback backends are useful for validating the evaluation pipeline, but they are not representative of real segmentation performance.
 
+### VOC20 vs VOC21
+
+`eval_pascal_voc.py` exposes `--voc-mode voc20|voc21`.
+
+- `voc20` is the default and preserves the existing reported numbers. It maps prediction `-1` to VOC background label `0`, maps prediction labels `0-19` to VOC foreground labels `1-20`, ignores GT label `255`, and reports mIoU over only the 20 foreground classes. By default, GT background label `0` remains valid, so foreground predictions on background pixels still count in each foreground class union as false positives. Background IoU is not included in the final mIoU.
+- `voc20 --voc20-ignore-background` switches to a stricter without-background style: GT background pixels are ignored before the confusion matrix. This can be closer to some paper tables that report VOC foreground-only evaluation without counting background pixels.
+- `voc21` evaluates background plus the 20 foreground classes and includes background IoU in mIoU. The current model has no separate learned background class; prediction `-1` / unassigned pixels become VOC background.
+
+Paper results can differ depending on whether they use VOC20 foreground-only, VOC20 with GT background ignored, or VOC21 background-inclusive evaluation. Check the table protocol before comparing against ClearCLIP or ProxyCLIP numbers.
+
 ## VOC Evaluation Diagnostics
 
 After running `eval_pascal_voc.py`, use `analyze_voc_outputs.py` to inspect failure modes from the saved prediction arrays, per-image debug JSON, and Pascal VOC GT masks:
@@ -70,7 +90,22 @@ After running `eval_pascal_voc.py`, use `analyze_voc_outputs.py` to inspect fail
 python analyze_voc_outputs.py --eval-dir outputs/voc_real_fullval --voc-root path/to/VOCdevkit/VOC2012 --output-json outputs/voc_real_fullval/diagnostics.json
 ```
 
-The diagnostics script does not read or save large image files. It reports per-image foreground IoU, foreground pixel ratios, class distributions, region counts, average confidence, uncertainty counts, route-type counts, and summary rankings such as worst/best images, foreground over- or under-prediction, most predicted classes, most missed GT classes, and global route-type distribution.
+The diagnostics script does not read or save large image files. It reports per-image foreground IoU, foreground pixel ratios, GT background pixel ratio, predicted background/unassigned ratio, foreground false positives on GT background, class distributions, region counts, finite-pixel average confidence, mean foreground confidence, finite confidence pixel ratio, unassigned pixel ratio, uncertainty counts, route-type counts, and summary rankings such as worst/best images, foreground over- or under-prediction, most predicted classes, most missed GT classes, and global route-type distribution.
+
+## Background Filtering
+
+`infer_ur_ovss.py` and `eval_pascal_voc.py` support two lightweight foreground filters after region routing and before pixel fusion:
+
+- `--background-threshold`: filters regions whose routed confidence is below the threshold.
+- `--background-margin-threshold`: filters regions whose semantic margin is below the threshold.
+
+Both default to `0.0`, which keeps the previous behavior. Filtered regions stay in the debug JSON with `filtered_as_background` and `background_filter_reason`, but they do not contribute foreground pixels to the final segmentation map.
+
+For Pascal VOC threshold sweeps, start with small validation limits before full val:
+
+```bash
+python eval_pascal_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 50 --output-dir outputs/voc_bg_t020_m000 --semantic-backend clip --mask-backend sam --sam-checkpoint path/to/sam_vit_b.pth --sam-model-type vit_b --feature-backend dinov2 --dinov2-model facebook/dinov2-small --max-masks 50 --background-threshold 0.20 --background-margin-threshold 0.00
+```
 
 ## Preparing Real Backend Resources
 

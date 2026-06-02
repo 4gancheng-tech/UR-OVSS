@@ -7,8 +7,11 @@ from PIL import Image
 import eval_pascal_voc
 from eval_pascal_voc import (
     VOC_CLASSES,
+    build_arg_parser,
     compute_confusion_matrix,
     compute_iou_from_confusion,
+    compute_voc_confusion_matrix,
+    summarize_voc_metrics,
     evaluate_dataset,
     map_prediction_to_voc_labels,
 )
@@ -47,6 +50,33 @@ def test_voc_class_list_contains_20_foreground_classes():
     assert len(VOC_CLASSES) == 20
     assert VOC_CLASSES[0] == "aeroplane"
     assert VOC_CLASSES[-1] == "tvmonitor"
+
+
+def test_eval_parser_accepts_clearclip_semantic_backend():
+    """VOC evaluation CLI should accept the ClearCLIP semantic backend."""
+
+    parser = build_arg_parser()
+
+    args = parser.parse_args(
+        [
+            "--voc-root",
+            "VOC2012",
+            "--semantic-backend",
+            "clearclip",
+        ]
+    )
+
+    assert args.semantic_backend == "clearclip"
+
+
+def test_eval_parser_accepts_voc_mode():
+    """VOC evaluation CLI should expose explicit VOC20/VOC21 modes."""
+
+    parser = build_arg_parser()
+
+    args = parser.parse_args(["--voc-root", "VOC2012", "--voc-mode", "voc21"])
+
+    assert args.voc_mode == "voc21"
 
 
 def test_confusion_matrix_ignores_255_labels():
@@ -95,6 +125,45 @@ def test_iou_computation_returns_nan_for_absent_classes():
     np.testing.assert_allclose(iou, np.array([1.0, 1.0 / 3.0, 3.0 / 5.0]), rtol=1e-6)
 
 
+def test_voc20_and_voc21_background_handling_compute_expected_iou():
+    """VOC20/VOC21 should differ in background handling while ignoring 255."""
+
+    pred_raw = np.array(
+        [
+            [-1, 0, 1, 0],
+            [0, 1, -1, -1],
+        ],
+        dtype=np.int32,
+    )
+    target = np.array(
+        [
+            [0, 1, 1, 255],
+            [0, 2, 2, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    confusion_default = compute_voc_confusion_matrix(pred_raw, target, voc_mode="voc20")
+    metrics_default = summarize_voc_metrics(confusion_default, voc_mode="voc20")
+    metrics_voc21 = summarize_voc_metrics(confusion_default, voc_mode="voc21")
+    confusion_ignore_bg = compute_voc_confusion_matrix(
+        pred_raw,
+        target,
+        voc_mode="voc20",
+        voc20_ignore_background=True,
+    )
+    metrics_ignore_bg = summarize_voc_metrics(confusion_ignore_bg, voc_mode="voc20")
+
+    np.testing.assert_allclose(metrics_default["per_class_iou"]["aeroplane"], 1.0 / 3.0, rtol=1e-6)
+    np.testing.assert_allclose(metrics_default["per_class_iou"]["bicycle"], 1.0 / 3.0, rtol=1e-6)
+    assert "background" not in metrics_default["per_class_iou"]
+    np.testing.assert_allclose(metrics_default["mIoU"], 1.0 / 3.0, rtol=1e-6)
+    np.testing.assert_allclose(metrics_voc21["per_class_iou"]["background"], 0.5, rtol=1e-6)
+    np.testing.assert_allclose(metrics_voc21["mIoU"], (0.5 + 1.0 / 3.0 + 1.0 / 3.0) / 3.0, rtol=1e-6)
+    np.testing.assert_allclose(metrics_ignore_bg["per_class_iou"]["aeroplane"], 0.5, rtol=1e-6)
+    np.testing.assert_allclose(metrics_ignore_bg["mIoU"], (0.5 + 1.0 / 3.0) / 2.0, rtol=1e-6)
+
+
 def test_evaluate_dataset_runs_on_fake_voc_with_fallback_backend(tmp_path):
     """VOC evaluation should run end-to-end on a tiny fake dataset."""
 
@@ -115,11 +184,18 @@ def test_evaluate_dataset_runs_on_fake_voc_with_fallback_backend(tmp_path):
     assert metrics["evaluated_images"] == 1
     assert metrics["skipped_images"] == 0
     assert len(metrics["per_class_iou"]) == 20
+    assert metrics["voc_mode"] == "voc20"
+    assert metrics["voc20_ignore_background"] is False
+    assert metrics["background_iou"] is None
+    assert "background" not in metrics["per_class_iou"]
     assert Path(metrics["metrics_path"]).exists()
     saved_metrics = json.loads(Path(metrics["metrics_path"]).read_text(encoding="utf-8"))
-    assert set(saved_metrics) == {
+    assert {
         "split",
         "voc_root",
+        "voc_mode",
+        "voc20_ignore_background",
+        "background_iou",
         "mIoU",
         "per_class_iou",
         "evaluated_images",
@@ -127,9 +203,32 @@ def test_evaluate_dataset_runs_on_fake_voc_with_fallback_backend(tmp_path):
         "skipped",
         "classes",
         "metrics_path",
-    }
+    } <= set(saved_metrics)
     assert saved_metrics["evaluated_images"] == 1
     assert not list((output_dir / "visualizations").glob("*.png"))
+
+
+def test_evaluate_dataset_voc21_reports_background_class(tmp_path):
+    """VOC21 mode should include background in classes and mIoU."""
+
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001"])
+
+    metrics = evaluate_dataset(
+        voc_root=voc_root,
+        split="val",
+        output_dir=tmp_path / "voc_eval_21",
+        limit=1,
+        semantic_backend="fallback",
+        mask_backend="fallback",
+        feature_backend="fallback",
+        voc_mode="voc21",
+        save_vis=False,
+    )
+
+    assert metrics["voc_mode"] == "voc21"
+    assert metrics["classes"][0] == "background"
+    assert "background" in metrics["per_class_iou"]
+    assert metrics["background_iou"] == metrics["per_class_iou"]["background"]
 
 
 def test_evaluate_dataset_initializes_backends_once_with_reusable_adapters(monkeypatch, tmp_path):
@@ -232,3 +331,62 @@ def test_evaluate_dataset_initializes_backends_once_with_reusable_adapters(monke
 
     assert metrics["evaluated_images"] == 2
     assert init_counts == {"semantic": 1, "mask": 1, "feature": 1}
+
+
+def test_evaluate_dataset_runs_with_fake_clearclip_adapter(monkeypatch, tmp_path):
+    """VOC evaluation should accept the clearclip semantic backend."""
+
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001"])
+    requested_backends = []
+
+    class FakeClearClipAdapter:
+        """Fake dense semantic adapter for eval plumbing."""
+
+        description = "fake clearclip dense logits"
+
+        def prepare_image(self, image, image_array):
+            """Accept per-image preparation."""
+
+            del image, image_array
+
+        def score_region(self, mask, class_names, positive_prompts, negative_prompts):
+            """Return valid semantic scores."""
+
+            del mask
+            base_scores = np.linspace(1.0, 0.0, len(class_names), dtype=np.float32)
+            positive_scores = np.repeat(
+                base_scores[:, None],
+                len(positive_prompts[class_names[0]]),
+                axis=1,
+            )
+            negative_scores = np.zeros(
+                (len(class_names), len(negative_prompts[class_names[0]])),
+                dtype=np.float32,
+            )
+            return RegionSemanticScores(
+                base_scores=base_scores,
+                positive_scores=positive_scores,
+                negative_scores=negative_scores,
+                prompt_rescore_scores=base_scores,
+            )
+
+    def fake_build_semantic_adapter(backend):
+        """Build only the fake clearclip backend for this test."""
+
+        requested_backends.append(backend)
+        return FakeClearClipAdapter()
+
+    monkeypatch.setattr(eval_pascal_voc, "build_semantic_adapter", fake_build_semantic_adapter)
+
+    metrics = evaluate_dataset(
+        voc_root=voc_root,
+        split="val",
+        output_dir=tmp_path / "voc_clearclip_eval",
+        limit=1,
+        semantic_backend="clearclip",
+        mask_backend="fallback",
+        feature_backend="fallback",
+    )
+
+    assert requested_backends == ["clearclip"]
+    assert metrics["evaluated_images"] == 1

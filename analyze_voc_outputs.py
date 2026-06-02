@@ -97,6 +97,16 @@ def _class_distribution(labels: np.ndarray, valid: np.ndarray) -> Dict[str, Dict
     return distribution
 
 
+def _finite_mean(values: np.ndarray, selector: np.ndarray) -> Optional[float]:
+    """Compute a finite-only mean for selected pixels, or None if empty."""
+
+    selected = np.asarray(values, dtype=np.float32)[selector]
+    finite_selected = selected[np.isfinite(selected)]
+    if finite_selected.size == 0:
+        return None
+    return float(finite_selected.mean())
+
+
 def _compact_image_record(record: Dict[str, Any]) -> Dict[str, Any]:
     """Create a small image summary entry for ranked lists."""
 
@@ -215,6 +225,12 @@ def _analyze_one_image(
 
     pred_fg_pixels = int((valid & (pred_voc > 0)).sum())
     gt_fg_pixels = int((valid & (target > 0) & (target < 255)).sum())
+    gt_background = valid & (target == 0)
+    gt_background_pixels = int(gt_background.sum())
+    background_false_positive_pixels = int((gt_background & (pred_voc > 0)).sum())
+    confidence_array = np.asarray(confidence, dtype=np.float32)
+    finite_confidence = valid & np.isfinite(confidence_array)
+    predicted_foreground = valid & (pred_voc > 0)
     regions = debug.get("regions", [])
     route_counts = Counter(str(region.get("route_type", "unknown")) for region in regions)
 
@@ -223,10 +239,20 @@ def _analyze_one_image(
         "foreground_iou": _foreground_iou(pred_voc, target, valid),
         "predicted_foreground_pixel_ratio": float(pred_fg_pixels / valid_pixels),
         "gt_foreground_pixel_ratio": float(gt_fg_pixels / valid_pixels),
+        "gt_background_pixel_ratio": float(gt_background_pixels / valid_pixels),
+        "predicted_background_or_unassigned_ratio": float(int((valid & (pred_voc == 0)).sum()) / valid_pixels),
+        "foreground_false_positive_on_gt_background": (
+            None
+            if gt_background_pixels == 0
+            else float(background_false_positive_pixels / gt_background_pixels)
+        ),
         "predicted_class_distribution": _class_distribution(pred_voc, valid),
         "gt_class_distribution": _class_distribution(target, valid),
         "num_regions": int(len(regions)),
-        "average_confidence": float(np.asarray(confidence, dtype=np.float32)[valid].mean()),
+        "average_confidence": _finite_mean(confidence_array, valid),
+        "mean_foreground_confidence": _finite_mean(confidence_array, predicted_foreground),
+        "finite_confidence_pixel_ratio": float(int(finite_confidence.sum()) / valid_pixels),
+        "unassigned_pixel_ratio": float(int((valid & (pred_voc == 0)).sum()) / valid_pixels),
         "semantic_uncertain_regions": int(sum(bool(region.get("semantic_uncertain")) for region in regions)),
         "spatial_uncertain_regions": int(sum(bool(region.get("spatial_uncertain")) for region in regions)),
         "route_type_counts": dict(sorted(route_counts.items())),

@@ -54,7 +54,14 @@ def test_analyze_eval_outputs_writes_diagnostics_json_for_fake_eval_output(tmp_p
         image_id="img_a",
         pred_raw=np.array([[0, 0, -1], [-1, -1, -1], [-1, 1, -1]], dtype=np.int32),
         target=np.array([[1, 1, 0], [0, 255, 0], [2, 2, 0]], dtype=np.uint8),
-        confidence=np.full((3, 3), 0.5, dtype=np.float32),
+        confidence=np.array(
+            [
+                [0.5, 0.6, -np.inf],
+                [-np.inf, -np.inf, -np.inf],
+                [-np.inf, 0.8, -np.inf],
+            ],
+            dtype=np.float32,
+        ),
         regions=[
             {"semantic_uncertain": True, "spatial_uncertain": False, "route_type": "semantic_rescore"},
             {"semantic_uncertain": False, "spatial_uncertain": True, "route_type": "spatial_downweight"},
@@ -66,7 +73,7 @@ def test_analyze_eval_outputs_writes_diagnostics_json_for_fake_eval_output(tmp_p
         image_id="img_b",
         pred_raw=np.array([[0, 1, 1], [0, 1, -1], [-1, -1, -1]], dtype=np.int32),
         target=np.array([[0, 0, 0], [1, 1, 0], [0, 0, 0]], dtype=np.uint8),
-        confidence=np.full((3, 3), 0.25, dtype=np.float32),
+        confidence=np.full((3, 3), -np.inf, dtype=np.float32),
         regions=[
             {"semantic_uncertain": True, "spatial_uncertain": True, "route_type": "multi_expert_average"},
         ],
@@ -88,20 +95,37 @@ def test_analyze_eval_outputs_writes_diagnostics_json_for_fake_eval_output(tmp_p
         "foreground_iou",
         "predicted_foreground_pixel_ratio",
         "gt_foreground_pixel_ratio",
+        "gt_background_pixel_ratio",
+        "predicted_background_or_unassigned_ratio",
+        "foreground_false_positive_on_gt_background",
         "predicted_class_distribution",
         "gt_class_distribution",
         "num_regions",
         "average_confidence",
+        "mean_foreground_confidence",
+        "finite_confidence_pixel_ratio",
+        "unassigned_pixel_ratio",
         "semantic_uncertain_regions",
         "spatial_uncertain_regions",
         "route_type_counts",
     }
+    np.testing.assert_allclose(image_a["average_confidence"], 1.9 / 3.0, rtol=1e-6)
+    np.testing.assert_allclose(image_a["mean_foreground_confidence"], 1.9 / 3.0, rtol=1e-6)
+    assert image_a["finite_confidence_pixel_ratio"] == 0.375
+    assert image_a["unassigned_pixel_ratio"] == 0.625
+    assert image_a["gt_background_pixel_ratio"] == 0.5
+    assert image_a["predicted_background_or_unassigned_ratio"] == 0.625
+    assert image_a["foreground_false_positive_on_gt_background"] == 0.0
     assert image_a["num_regions"] == 2
     assert image_a["semantic_uncertain_regions"] == 1
     assert image_a["spatial_uncertain_regions"] == 1
     assert image_a["route_type_counts"] == {"semantic_rescore": 1, "spatial_downweight": 1}
     assert image_a["predicted_class_distribution"]["aeroplane"]["pixels"] == 2
     assert image_a["gt_class_distribution"]["bicycle"]["pixels"] == 2
+    image_b = {record["image_id"]: record for record in saved["images"]}["img_b"]
+    assert image_b["average_confidence"] is None
+    assert image_b["mean_foreground_confidence"] is None
+    assert image_b["finite_confidence_pixel_ratio"] == 0.0
 
     summary = saved["summary"]
     assert set(summary) == {
