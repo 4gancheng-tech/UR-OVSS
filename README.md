@@ -42,6 +42,14 @@ python infer_ur_ovss.py --image path/to/image.jpg --classes "cat,dog,person,car"
 
 This backend currently uses a minimal ViT-B/16 dense patch-logit adapter inspired by the official ClearCLIP implementation. It does not vendor official ClearCLIP code or weights; see `docs/clearclip_integration_plan.md` for integration scope and attribution.
 
+To evaluate ClearCLIP-style dense logits directly on Pascal VOC without SAM, DINOv2, or routing:
+
+```bash
+python eval_clearclip_dense_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_clearclip_dense_l100 --voc-mode voc20 --voc20-ignore-background
+```
+
+Use this dense-only ablation to compare against the existing ClearCLIP + SAM and ClearCLIP + SAM + DINOv2 paths. See `docs/clearclip_dense_ablation.md` for the A/B/C/D comparison commands and the remaining gaps versus the official ClearCLIP sliding-window setup.
+
 To use the optional SAM mask backend:
 
 ```bash
