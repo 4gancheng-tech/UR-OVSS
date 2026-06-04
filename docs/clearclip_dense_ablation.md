@@ -22,6 +22,13 @@ A. **ClearCLIP Dense-Only**
 python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clearclip_l100 --voc-mode voc20 --voc20-ignore-background
 ```
 
+For a closer ClearCLIP-style alignment, enable resize, sliding-window inference,
+and text prototype averaging:
+
+```bash
+python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clearclip_aligned_l100 --voc-mode voc20 --voc20-ignore-background --resize-short-side 448 --max-long-side 2048 --slide-crop 448 --slide-stride 224 --prompt-ensemble imagenet --text-prototype-average
+```
+
 For the paper-style vanilla CLIP dense baseline, use the same evaluator with
 `--semantic-backend clip`:
 
@@ -90,17 +97,45 @@ Current repository status:
 - Resize to original image: implemented by resizing the dense grid to the input
   image shape.
 - ImageNet prompts: dense-only evaluation uses OpenAI ImageNet-style templates
-  and averages prompt logits per class.
-- Sliding-window inference: not implemented yet. The current backend still
-  relies on the `open_clip` preprocessing path, so large images are not decoded
-  with the official 448 crop / 224 stride sliding-window protocol.
-- Official text prototype averaging: approximated. This script averages dense
-  logits across prompts; the official implementation averages normalized text
-  features per class and normalizes the class prototype before image-text
-  logits.
+  by default.
+- Optional resize alignment: `eval_dense_voc.py` can resize the short side to
+  448 and cap the long side at 2048 before dense inference, then resize logits
+  back to the original image for VOC evaluation.
+- Optional sliding-window inference: `--slide-crop 448 --slide-stride 224`
+  averages overlapping crop logits before the final upsample.
+- Optional official-style text prototype averaging:
+  `--text-prototype-average` normalizes text features for each prompt,
+  averages prompts within a class, normalizes the class prototype again, and
+  computes dense visual-text logits.
 - MMSeg preprocessing and dataset protocol: not fully reproduced. This
   repository uses a lightweight PIL/numpy evaluator rather than the official
   MMSeg pipeline.
 
-Because of those remaining gaps, dense-only numbers from this script are an
-internal bottleneck diagnostic, not an official ClearCLIP reproduction.
+Remaining gaps:
+
+- The implementation is still ClearCLIP-style and does not vendor or execute
+  the official MMSeg `ClearCLIPSegmentation` class.
+- It still depends on the local `clearclip_backend.py` open_clip adapter and its
+  best-effort final-layer decomposition.
+- It does not reproduce the full MMSeg data preprocessor, distributed evaluator,
+  result formatting, or every official dataset config detail.
+- It does not apply extra post-processing beyond VOC argmax and the selected
+  VOC20/VOC21 evaluator.
+
+Because of those remaining gaps, dense-only numbers from this script are a
+stronger internal baseline and alignment check, not an official ClearCLIP
+benchmark reproduction.
+
+## Recommended Commands
+
+Limit=100 aligned smoke:
+
+```bash
+python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clearclip_aligned_l100 --voc-mode voc20 --voc20-ignore-background --resize-short-side 448 --max-long-side 2048 --slide-crop 448 --slide-stride 224 --prompt-ensemble imagenet --text-prototype-average
+```
+
+Full VOC val aligned run:
+
+```bash
+python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --output-dir outputs/voc_dense_clearclip_aligned_fullval --voc-mode voc20 --voc20-ignore-background --resize-short-side 448 --max-long-side 2048 --slide-crop 448 --slide-stride 224 --prompt-ensemble imagenet --text-prototype-average
+```

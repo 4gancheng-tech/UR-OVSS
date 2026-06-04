@@ -73,6 +73,49 @@ def _load_target_mask(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path), dtype=np.int64)
 
 
+def _image_to_array(image: Image.Image) -> np.ndarray:
+    """Convert an RGB PIL image to float32 array with shape [H, W, 3]."""
+
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _resize_image_for_dense_eval(
+    image: Image.Image,
+    resize_short_side: Optional[int] = None,
+    max_long_side: Optional[int] = None,
+) -> Image.Image:
+    """Optionally resize an image for dense evaluation.
+
+    Args:
+        image: RGB PIL image.
+        resize_short_side: Optional target short side in pixels.
+        max_long_side: Optional maximum long side in pixels after resizing.
+
+    Returns:
+        RGB PIL image used for dense inference.
+    """
+
+    width, height = image.size
+    scale = 1.0
+    if resize_short_side is not None:
+        if resize_short_side <= 0:
+            raise ValueError(f"resize_short_side must be positive when set, got {resize_short_side}.")
+        scale = float(resize_short_side) / float(min(width, height))
+    if max_long_side is not None:
+        if max_long_side <= 0:
+            raise ValueError(f"max_long_side must be positive when set, got {max_long_side}.")
+        resized_long_side = max(width, height) * scale
+        if resized_long_side > max_long_side:
+            scale = float(max_long_side) / float(max(width, height))
+
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    if (new_width, new_height) == (width, height):
+        return image
+    resample = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+    return image.resize((new_width, new_height), resample=resample)
+
+
 def _coerce_dense_grid(
     values: Any,
     patch_grid: tuple[int, int],
@@ -372,26 +415,149 @@ def build_dense_adapter(backend: str, model_name: str = "ViT-B-16", pretrained: 
     raise ValueError(f"Unknown dense semantic backend {backend!r}; expected 'clip' or 'clearclip'.")
 
 
-def compute_dense_logits_for_classes(adapter: Any, class_names: Sequence[str], output_shape: tuple[int, int]) -> np.ndarray:
-    """Compute image-sized class logits from a dense semantic adapter.
+def _prompt_groups_for_classes(class_names: Sequence[str], prompt_ensemble: str) -> List[List[str]]:
+    """Build prompt groups for class-level text prototypes."""
 
-    Args:
-        adapter: Dense adapter prepared for the current image.
-        class_names: Class names with length C.
-        output_shape: Desired output shape [H, W].
+    if prompt_ensemble != "imagenet":
+        raise ValueError(f"Unsupported prompt ensemble {prompt_ensemble!r}; expected 'imagenet'.")
+    prompt_count = len(OPENAI_IMAGENET_TEMPLATES)
+    flat_prompts = build_imagenet_prompts(class_names)
+    return [
+        flat_prompts[index * prompt_count : (index + 1) * prompt_count]
+        for index in range(len(class_names))
+    ]
 
-    Returns:
-        Dense class logits with shape [H, W, C].
-    """
+
+def _compute_dense_logits_for_classes(
+    adapter: Any,
+    class_names: Sequence[str],
+    output_shape: tuple[int, int],
+    prompt_ensemble: str,
+    text_prototype_average: bool,
+) -> np.ndarray:
+    """Compute image-sized class logits from a dense semantic adapter."""
+
+    if prompt_ensemble != "imagenet":
+        raise ValueError(f"Unsupported prompt ensemble {prompt_ensemble!r}; expected 'imagenet'.")
 
     if hasattr(adapter, "dense_logits_for_classes"):
         return adapter.dense_logits_for_classes(class_names, output_shape)
+
+    if text_prototype_average:
+        if not hasattr(adapter, "dense_logits_for_text_prototypes"):
+            raise SemanticBackendError(
+                "text_prototype_average requires a dense adapter exposing dense_logits_for_text_prototypes()."
+            )
+        dense_logits = adapter.dense_logits_for_text_prototypes(
+            _prompt_groups_for_classes(class_names, prompt_ensemble=prompt_ensemble)
+        )
+        return _resize_logits(np.asarray(dense_logits, dtype=np.float32), output_shape)
 
     prompt_count = len(OPENAI_IMAGENET_TEMPLATES)
     prompt_logits = adapter.dense_logits_for_prompts(build_imagenet_prompts(class_names))
     prompt_logits = _resize_logits(prompt_logits, output_shape)
     height, width = output_shape
     return prompt_logits.reshape(height, width, len(class_names), prompt_count).mean(axis=-1).astype(np.float32)
+
+
+def compute_dense_logits_for_classes(
+    adapter: Any,
+    class_names: Sequence[str],
+    output_shape: tuple[int, int],
+    prompt_ensemble: str = "imagenet",
+    text_prototype_average: bool = False,
+) -> np.ndarray:
+    """Compute image-sized class logits from a dense semantic adapter.
+
+    Args:
+        adapter: Dense adapter prepared for the current image.
+        class_names: Class names with length C.
+        output_shape: Desired output shape [H, W].
+        prompt_ensemble: Prompt template set. Currently only "imagenet".
+        text_prototype_average: For ClearCLIP-style prompt adapters, average
+            normalized text features per class before computing dense logits.
+
+    Returns:
+        Dense class logits with shape [H, W, C].
+    """
+
+    return _compute_dense_logits_for_classes(
+        adapter=adapter,
+        class_names=class_names,
+        output_shape=output_shape,
+        prompt_ensemble=prompt_ensemble,
+        text_prototype_average=text_prototype_average,
+    )
+
+
+def _iter_sliding_windows(height: int, width: int, crop_size: int, stride: int):
+    """Yield sliding-window crop boxes as (y1, y2, x1, x2)."""
+
+    if crop_size <= 0:
+        raise ValueError(f"slide_crop must be positive for sliding-window inference, got {crop_size}.")
+    if stride <= 0:
+        raise ValueError(f"slide_stride must be positive for sliding-window inference, got {stride}.")
+
+    h_grids = max(height - crop_size + stride - 1, 0) // stride + 1
+    w_grids = max(width - crop_size + stride - 1, 0) // stride + 1
+    for h_idx in range(h_grids):
+        for w_idx in range(w_grids):
+            y1 = h_idx * stride
+            x1 = w_idx * stride
+            y2 = min(y1 + crop_size, height)
+            x2 = min(x1 + crop_size, width)
+            y1 = max(y2 - crop_size, 0)
+            x1 = max(x2 - crop_size, 0)
+            yield y1, y2, x1, x2
+
+
+def _compute_dense_logits_for_image(
+    adapter: Any,
+    image: Image.Image,
+    image_array: np.ndarray,
+    class_names: Sequence[str],
+    prompt_ensemble: str,
+    text_prototype_average: bool,
+    slide_crop: int = 0,
+    slide_stride: int = 0,
+) -> np.ndarray:
+    """Compute dense logits on a full image or by averaged sliding windows."""
+
+    height, width = image_array.shape[:2]
+    if slide_crop <= 0:
+        adapter.prepare_image(image, image_array)
+        return compute_dense_logits_for_classes(
+            adapter,
+            class_names,
+            output_shape=(height, width),
+            prompt_ensemble=prompt_ensemble,
+            text_prototype_average=text_prototype_average,
+        )
+
+    if slide_stride <= 0:
+        raise ValueError("slide_stride must be positive when slide_crop is enabled.")
+
+    logits_sum: Optional[np.ndarray] = None
+    count = np.zeros((height, width, 1), dtype=np.float32)
+    for y1, y2, x1, x2 in _iter_sliding_windows(height, width, crop_size=slide_crop, stride=slide_stride):
+        crop = image.crop((x1, y1, x2, y2))
+        crop_array = image_array[y1:y2, x1:x2]
+        adapter.prepare_image(crop, crop_array)
+        crop_logits = compute_dense_logits_for_classes(
+            adapter,
+            class_names,
+            output_shape=crop_array.shape[:2],
+            prompt_ensemble=prompt_ensemble,
+            text_prototype_average=text_prototype_average,
+        )
+        if logits_sum is None:
+            logits_sum = np.zeros((height, width, crop_logits.shape[-1]), dtype=np.float32)
+        logits_sum[y1:y2, x1:x2] += crop_logits
+        count[y1:y2, x1:x2] += 1.0
+
+    if logits_sum is None or np.any(count == 0):
+        raise RuntimeError("Sliding-window dense inference failed to cover the full image.")
+    return (logits_sum / count).astype(np.float32)
 
 
 def _prediction_to_confusion(
@@ -431,6 +597,12 @@ def evaluate_dataset(
     model_name: str = "ViT-B-16",
     pretrained: str = "openai",
     save_debug: bool = False,
+    resize_short_side: Optional[int] = None,
+    max_long_side: Optional[int] = None,
+    slide_crop: int = 0,
+    slide_stride: int = 0,
+    prompt_ensemble: str = "imagenet",
+    text_prototype_average: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate dense-only CLIP/ClearCLIP logits on Pascal VOC.
 
@@ -447,6 +619,14 @@ def evaluate_dataset(
         model_name: open_clip model name.
         pretrained: open_clip pretrained tag.
         save_debug: Save one lightweight JSON record per evaluated image.
+        resize_short_side: Optional short-side resize before dense inference.
+        max_long_side: Optional long-side cap after resize.
+        slide_crop: Sliding-window crop size. Zero disables sliding-window
+            inference and preserves historical whole-image behavior.
+        slide_stride: Sliding-window stride.
+        prompt_ensemble: Prompt template set. Currently only "imagenet".
+        text_prototype_average: For ClearCLIP-style adapters, average text
+            prompt features per class before dense image-text logits.
 
     Returns:
         Metrics dictionary also written to `metrics.json`.
@@ -456,6 +636,12 @@ def evaluate_dataset(
         raise ValueError(f"semantic_backend must be 'clip' or 'clearclip', got {semantic_backend!r}.")
     if voc_mode not in {"voc20", "voc21"}:
         raise ValueError(f"voc_mode must be 'voc20' or 'voc21', got {voc_mode!r}.")
+    if prompt_ensemble != "imagenet":
+        raise ValueError(f"Unsupported prompt ensemble {prompt_ensemble!r}; expected 'imagenet'.")
+    if slide_crop < 0:
+        raise ValueError(f"slide_crop must be non-negative, got {slide_crop}.")
+    if slide_crop > 0 and slide_stride <= 0:
+        raise ValueError("slide_stride must be positive when slide_crop is enabled.")
 
     voc_root = Path(voc_root)
     output_dir = Path(output_dir)
@@ -493,8 +679,23 @@ def evaluate_dataset(
             continue
 
         image, image_array = _load_rgb_image(image_path)
-        adapter.prepare_image(image, image_array)
-        dense_logits = compute_dense_logits_for_classes(adapter, eval_class_names, image_array.shape[:2])
+        eval_image = _resize_image_for_dense_eval(
+            image,
+            resize_short_side=resize_short_side,
+            max_long_side=max_long_side,
+        )
+        eval_array = _image_to_array(eval_image)
+        dense_logits_eval = _compute_dense_logits_for_image(
+            adapter=adapter,
+            image=eval_image,
+            image_array=eval_array,
+            class_names=eval_class_names,
+            prompt_ensemble=prompt_ensemble,
+            text_prototype_average=text_prototype_average,
+            slide_crop=slide_crop,
+            slide_stride=slide_stride,
+        )
+        dense_logits = _resize_logits(dense_logits_eval, image_array.shape[:2])
         pred_indices = np.argmax(dense_logits, axis=-1).astype(np.int64)
 
         prediction_path = prediction_dir / f"{image_id}.npy"
@@ -517,6 +718,7 @@ def evaluate_dataset(
                 "semantic_backend": semantic_backend,
                 "adapter": getattr(adapter, "description", semantic_backend),
                 "class_names": list(eval_class_names),
+                "eval_image_size": {"width": eval_image.width, "height": eval_image.height},
                 "dense_logits_shape": list(dense_logits.shape),
                 "prediction_npy": str(prediction_path),
                 "prediction_label_space": _label_space(voc_mode),
@@ -542,9 +744,15 @@ def evaluate_dataset(
         "pretrained": pretrained,
         "prompt_templates": (
             "openai_imagenet_template_text_prototype_average"
-            if semantic_backend == "clip"
+            if semantic_backend == "clip" or text_prototype_average
             else "openai_imagenet_template_logit_average"
         ),
+        "resize_short_side": resize_short_side,
+        "max_long_side": max_long_side,
+        "slide_crop": slide_crop,
+        "slide_stride": slide_stride,
+        "prompt_ensemble": prompt_ensemble,
+        "text_prototype_average": bool(text_prototype_average),
         "uses_sam": False,
         "uses_dinov2": False,
         "uses_routing": False,
@@ -594,6 +802,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="ViT-B-16", help="open_clip model name.")
     parser.add_argument("--pretrained", default="openai", help="open_clip pretrained tag.")
     parser.add_argument("--save-debug", action="store_true", help="Save one lightweight debug JSON per image.")
+    parser.add_argument(
+        "--resize-short-side",
+        default=None,
+        type=int,
+        help="Optionally resize the image short side before dense inference, e.g. 448.",
+    )
+    parser.add_argument(
+        "--max-long-side",
+        default=None,
+        type=int,
+        help="Optionally cap the resized image long side, e.g. 2048.",
+    )
+    parser.add_argument(
+        "--slide-crop",
+        default=0,
+        type=int,
+        help="Sliding-window crop size. Default 0 preserves whole-image inference.",
+    )
+    parser.add_argument(
+        "--slide-stride",
+        default=0,
+        type=int,
+        help="Sliding-window stride. Required when --slide-crop is positive.",
+    )
+    parser.add_argument(
+        "--prompt-ensemble",
+        choices=("imagenet",),
+        default="imagenet",
+        help="Prompt ensemble used for dense text logits.",
+    )
+    parser.add_argument(
+        "--text-prototype-average",
+        action="store_true",
+        help="Average normalized prompt text features per class before dense logits.",
+    )
     return parser
 
 
@@ -613,6 +856,12 @@ def main() -> None:
             model_name=args.model_name,
             pretrained=args.pretrained,
             save_debug=args.save_debug,
+            resize_short_side=args.resize_short_side,
+            max_long_side=args.max_long_side,
+            slide_crop=args.slide_crop,
+            slide_stride=args.slide_stride,
+            prompt_ensemble=args.prompt_ensemble,
+            text_prototype_average=args.text_prototype_average,
         )
     except (FileNotFoundError, ValueError, RuntimeError, SemanticBackendError) as exc:
         raise SystemExit(f"Dense VOC evaluation error: {exc}") from exc
@@ -622,6 +871,11 @@ def main() -> None:
     print(f"mIoU: {metrics['mIoU']:.6f}")
     print(f"Semantic backend: {metrics['semantic_backend']}")
     print(f"VOC mode: {metrics['voc_mode']}")
+    print(f"Resize short side: {metrics['resize_short_side']}")
+    print(f"Max long side: {metrics['max_long_side']}")
+    print(f"Slide crop/stride: {metrics['slide_crop']}/{metrics['slide_stride']}")
+    print(f"Prompt ensemble: {metrics['prompt_ensemble']}")
+    print(f"Text prototype average: {metrics['text_prototype_average']}")
     if metrics["voc_mode"] == "voc20":
         print(f"VOC20 ignore background: {metrics['voc20_ignore_background']}")
     if metrics["background_iou"] is not None:

@@ -220,6 +220,39 @@ class ClearClipSemanticAdapter:
             self._dense_score_cache[prompt_key] = dense_scores.astype(np.float32)
         return self._dense_score_cache[prompt_key]
 
+    def dense_logits_for_text_prototypes(self, prompt_groups: Sequence[Sequence[str]]) -> np.ndarray:
+        """Compute dense logits from per-class averaged text prototypes.
+
+        Args:
+            prompt_groups: Prompt strings grouped by class. The outer length is
+                C and each inner sequence contains prompt templates for one
+                class.
+
+        Returns:
+            Dense class logits with shape [H, W, C]. For each class, prompt
+            text features are normalized, averaged, normalized again, then
+            compared against dense visual features.
+        """
+
+        if self.dense_features is None:
+            raise self.error_cls("ClearCLIP semantic backend was used before prepare_image().")
+
+        prototype_key = tuple(tuple(group) for group in prompt_groups)
+        cache_key = ("__prototype_average__", *prototype_key)
+        if cache_key not in self._dense_score_cache:
+            prototypes = []
+            for prompts in prototype_key:
+                if not prompts:
+                    raise self.error_cls("Text prototype averaging received an empty prompt group.")
+                text_features = self._text_features(prompts)
+                prototype = text_features.mean(axis=0)
+                prototype = _normalize_last_dim(prototype)
+                prototypes.append(prototype)
+            text_prototypes = np.stack(prototypes, axis=0).astype(np.float32)
+            dense_scores = np.tensordot(self.dense_features, text_prototypes.T, axes=([-1], [0]))
+            self._dense_score_cache[cache_key] = dense_scores.astype(np.float32)
+        return self._dense_score_cache[cache_key]
+
     def score_region(
         self,
         mask: np.ndarray,

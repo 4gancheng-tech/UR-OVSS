@@ -46,12 +46,14 @@ class FakeDenseAdapter:
 
         self.backend = backend
         self.image_shape = None
+        self.prepared_shapes = []
 
     def prepare_image(self, image, image_array):
         """Record image shape for dense logits."""
 
         del image
         self.image_shape = image_array.shape[:2]
+        self.prepared_shapes.append(self.image_shape)
 
     def dense_logits_for_classes(self, class_names, output_shape):
         """Return class logits that match the fake VOC target foreground."""
@@ -112,6 +114,76 @@ def test_dense_eval_runs_clip_backend_with_fake_logits(monkeypatch, tmp_path):
     assert metrics["per_class_iou"]["bicycle"] == 1.0
     assert Path(metrics["metrics_path"]).exists()
     assert len(list((tmp_path / "dense_clip_eval" / "predictions").glob("*.npy"))) == 1
+
+
+def test_dense_eval_default_alignment_options_keep_original_image_shape(monkeypatch, tmp_path):
+    """Default dense eval settings should keep old whole-image behavior."""
+
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001"])
+    adapters = []
+
+    def fake_build_dense_adapter(backend, **kwargs):
+        """Return a fake adapter and keep a handle for assertions."""
+
+        del kwargs
+        adapter = FakeDenseAdapter(backend)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(eval_dense_voc, "build_dense_adapter", fake_build_dense_adapter)
+
+    metrics = eval_dense_voc.evaluate_dataset(
+        voc_root=voc_root,
+        split="val",
+        output_dir=tmp_path / "dense_default_eval",
+        limit=1,
+        semantic_backend="clearclip",
+        voc_mode="voc20",
+        voc20_ignore_background=True,
+    )
+
+    assert adapters[0].prepared_shapes == [(8, 8)]
+    assert metrics["resize_short_side"] is None
+    assert metrics["max_long_side"] is None
+    assert metrics["slide_crop"] == 0
+    assert metrics["slide_stride"] == 0
+    assert metrics["prompt_ensemble"] == "imagenet"
+    assert metrics["text_prototype_average"] is False
+
+
+def test_dense_eval_resize_options_prepare_resized_image(monkeypatch, tmp_path):
+    """Resize options should affect dense inference while predictions stay original size."""
+
+    voc_root = _create_fake_voc_dataset(tmp_path, ["fake_0001"])
+    adapters = []
+
+    def fake_build_dense_adapter(backend, **kwargs):
+        """Return a fake adapter and keep a handle for assertions."""
+
+        del kwargs
+        adapter = FakeDenseAdapter(backend)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(eval_dense_voc, "build_dense_adapter", fake_build_dense_adapter)
+
+    metrics = eval_dense_voc.evaluate_dataset(
+        voc_root=voc_root,
+        split="val",
+        output_dir=tmp_path / "dense_resize_eval",
+        limit=1,
+        semantic_backend="clearclip",
+        voc_mode="voc20",
+        voc20_ignore_background=True,
+        resize_short_side=4,
+        max_long_side=8,
+    )
+    pred = np.load(Path(metrics["prediction_files"][0]))
+
+    assert adapters[0].prepared_shapes == [(4, 4)]
+    assert pred.shape == (8, 8)
+    assert metrics["resize_short_side"] == 4
+    assert metrics["max_long_side"] == 8
 
 
 def test_dense_eval_runs_clearclip_backend_with_fake_logits(monkeypatch, tmp_path):
@@ -219,6 +291,74 @@ def test_clearclip_dense_prompt_logits_path_still_works():
 
     assert dense_logits.shape == (2, 2, 2)
     assert np.all(dense_logits[..., 0] > dense_logits[..., 1])
+
+
+def test_sliding_window_dense_logits_shape_and_overlap_average():
+    """Sliding-window dense logits should average overlapping crop predictions."""
+
+    class FakeSlidingAdapter:
+        """Fake adapter that emits a different constant per crop."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_image(self, image, image_array):
+            """Count crop preparations."""
+
+            del image, image_array
+            self.calls += 1
+
+        def dense_logits_for_classes(self, class_names, output_shape):
+            """Return crop logits filled with the current call index."""
+
+            height, width = output_shape
+            logits = np.zeros((height, width, len(class_names)), dtype=np.float32)
+            logits[..., 0] = float(self.calls)
+            return logits
+
+    image = Image.fromarray(np.zeros((6, 6, 3), dtype=np.uint8), mode="RGB")
+    image_array = np.zeros((6, 6, 3), dtype=np.float32)
+
+    dense_logits = eval_dense_voc._compute_dense_logits_for_image(
+        adapter=FakeSlidingAdapter(),
+        image=image,
+        image_array=image_array,
+        class_names=["aeroplane", "bicycle"],
+        prompt_ensemble="imagenet",
+        text_prototype_average=False,
+        slide_crop=4,
+        slide_stride=2,
+    )
+
+    assert dense_logits.shape == (6, 6, 2)
+    assert dense_logits[0, 0, 0] == 1.0
+    assert dense_logits[3, 3, 0] == 2.5
+
+
+def test_prompt_prototype_average_keeps_class_count():
+    """Text prototype averaging should return one logit channel per class."""
+
+    class FakePrototypeAdapter:
+        """Fake ClearCLIP adapter exposing text prototype logits."""
+
+        def dense_logits_for_text_prototypes(self, prompt_groups):
+            """Return one class channel per prompt group."""
+
+            logits = np.zeros((3, 2, len(prompt_groups)), dtype=np.float32)
+            for index, prompts in enumerate(prompt_groups):
+                assert len(prompts) == len(eval_dense_voc.OPENAI_IMAGENET_TEMPLATES)
+                logits[..., index] = float(index)
+            return logits
+
+    dense_logits = eval_dense_voc.compute_dense_logits_for_classes(
+        FakePrototypeAdapter(),
+        ["aeroplane", "bicycle", "bird"],
+        output_shape=(3, 2),
+        prompt_ensemble="imagenet",
+        text_prototype_average=True,
+    )
+
+    assert dense_logits.shape == (3, 2, 3)
 
 
 def test_original_pascal_eval_cli_does_not_expose_dense_backend():
