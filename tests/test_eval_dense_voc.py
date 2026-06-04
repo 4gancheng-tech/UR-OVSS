@@ -6,6 +6,7 @@ from PIL import Image
 
 import eval_dense_voc
 import eval_pascal_voc
+from infer_ur_ovss import SemanticBackendError
 
 
 def _create_fake_voc_dataset(tmp_path: Path, image_ids):
@@ -155,6 +156,69 @@ def test_dense_eval_voc21_metrics_are_correct_with_fake_logits(monkeypatch, tmp_
     assert metrics["mIoU"] == 1.0
     saved = json.loads(Path(metrics["metrics_path"]).read_text(encoding="utf-8"))
     assert saved["per_class_iou"]["background"] == 1.0
+
+
+def test_vanilla_clip_dense_grid_squeezes_batch_dimension():
+    """Vanilla CLIP dense grids should drop a singleton batch dimension."""
+
+    dense = np.arange(1 * 2 * 3 * 4, dtype=np.float32).reshape(1, 2, 3, 4)
+
+    coerced = eval_dense_voc._coerce_dense_grid(dense, patch_grid=(2, 3), value_name="test dense grid")
+
+    assert coerced.shape == (2, 3, 4)
+    np.testing.assert_array_equal(coerced, dense[0])
+
+
+def test_vanilla_clip_dense_grid_reshapes_flat_patch_tokens():
+    """Flat [N, C] patch logits should reshape using the patch grid."""
+
+    dense = np.arange(6 * 4, dtype=np.float32).reshape(6, 4)
+
+    coerced = eval_dense_voc._coerce_dense_grid(dense, patch_grid=(2, 3), value_name="test dense grid")
+
+    assert coerced.shape == (2, 3, 4)
+    np.testing.assert_array_equal(coerced, dense.reshape(2, 3, 4))
+
+
+def test_vanilla_clip_dense_grid_rejects_illegal_shape():
+    """Illegal dense grid shapes should produce a clear error."""
+
+    dense = np.zeros((1, 1, 2, 3, 4), dtype=np.float32)
+
+    try:
+        eval_dense_voc._coerce_dense_grid(dense, patch_grid=(2, 3), value_name="test dense grid")
+    except SemanticBackendError as exc:
+        assert "test dense grid" in str(exc)
+        assert "(1, 1, 2, 3, 4)" in str(exc)
+    else:
+        raise AssertionError("Expected SemanticBackendError for illegal dense grid shape.")
+
+
+def test_clearclip_dense_prompt_logits_path_still_works():
+    """ClearCLIP adapters without dense_logits_for_classes should keep working."""
+
+    class FakeClearClipPromptAdapter:
+        """Fake ClearCLIP-style prompt-logit adapter."""
+
+        def dense_logits_for_prompts(self, prompts):
+            """Return prompt logits grouped by class templates."""
+
+            logits = np.zeros((2, 2, len(prompts)), dtype=np.float32)
+            for index, prompt in enumerate(prompts):
+                if "aeroplane" in prompt:
+                    logits[..., index] = 3.0
+                elif "bicycle" in prompt:
+                    logits[..., index] = 1.0
+            return logits
+
+    dense_logits = eval_dense_voc.compute_dense_logits_for_classes(
+        FakeClearClipPromptAdapter(),
+        ["aeroplane", "bicycle"],
+        output_shape=(2, 2),
+    )
+
+    assert dense_logits.shape == (2, 2, 2)
+    assert np.all(dense_logits[..., 0] > dense_logits[..., 1])
 
 
 def test_original_pascal_eval_cli_does_not_expose_dense_backend():

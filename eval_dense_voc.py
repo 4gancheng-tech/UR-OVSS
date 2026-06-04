@@ -73,6 +73,43 @@ def _load_target_mask(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path), dtype=np.int64)
 
 
+def _coerce_dense_grid(
+    values: Any,
+    patch_grid: tuple[int, int],
+    value_name: str,
+    error_cls: type[RuntimeError] = SemanticBackendError,
+) -> np.ndarray:
+    """Coerce dense patch values to [grid_h, grid_w, C].
+
+    Args:
+        values: Dense values with shape [H, W, C], [1, H, W, C], or [H*W, C].
+        patch_grid: Expected patch grid as (grid_h, grid_w).
+        value_name: Human-readable name for error messages.
+        error_cls: Error class used for clear backend failures.
+
+    Returns:
+        Float32 dense grid with shape [grid_h, grid_w, C].
+    """
+
+    dense = np.asarray(values, dtype=np.float32)
+    grid_h, grid_w = patch_grid
+    if dense.ndim == 4 and dense.shape[0] == 1:
+        dense = dense[0]
+    if dense.ndim == 3:
+        return dense.astype(np.float32)
+    if dense.ndim == 2:
+        expected_tokens = grid_h * grid_w
+        if dense.shape[0] != expected_tokens:
+            raise error_cls(
+                f"{value_name} with shape {dense.shape} cannot be reshaped to patch grid {patch_grid}; "
+                f"expected first dimension {expected_tokens}."
+            )
+        return dense.reshape(grid_h, grid_w, dense.shape[-1]).astype(np.float32)
+    raise error_cls(
+        f"{value_name} must have shape [H, W, C], [1, H, W, C], or [H*W, C]; got {dense.shape}."
+    )
+
+
 class VanillaClipDenseAdapter:
     """Vanilla CLIP ViT dense patch-logit adapter backed by open_clip.
 
@@ -159,9 +196,16 @@ class VanillaClipDenseAdapter:
             with _inference_context():
                 image_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
                 dense = self._encode_dense_image_features(image_tensor)
+                patch_grid = self._patch_grid_from_tensor(self.model.visual, image_tensor)
         except Exception as exc:
             raise self.error_cls(f"Vanilla CLIP dense image feature extraction failed: {exc}") from exc
 
+        dense = _coerce_dense_grid(
+            dense,
+            patch_grid=patch_grid,
+            value_name="Vanilla CLIP dense patch features",
+            error_cls=self.error_cls,
+        )
         dense = _resize_logits(dense.astype(np.float32), self.image_shape)
         self.dense_features = _normalize_last_dim(dense).astype(np.float32)
 
