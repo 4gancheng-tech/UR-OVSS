@@ -50,6 +50,24 @@ python eval_clearclip_dense_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split 
 
 Use this dense-only ablation to compare against the existing ClearCLIP + SAM and ClearCLIP + SAM + DINOv2 paths. See `docs/clearclip_dense_ablation.md` for the A/B/C/D comparison commands and the remaining gaps versus the official ClearCLIP sliding-window setup.
 
+### Dense-Only CLIP Baselines
+
+The existing `--semantic-backend clip` path in `infer_ur_ovss.py` and `eval_pascal_voc.py` is region crop-level CLIP scoring over SAM masks. It is not the vanilla CLIP dense segmentation baseline used in open-vocabulary segmentation papers.
+
+Use `eval_dense_voc.py --semantic-backend clip` for the paper-style vanilla CLIP dense-only baseline:
+
+```bash
+python eval_dense_voc.py --semantic-backend clip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clip_l100 --voc-mode voc20 --voc20-ignore-background
+```
+
+Use the same script with `--semantic-backend clearclip` for a direct ClearCLIP dense-only comparison under the same evaluator and output format:
+
+```bash
+python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clearclip_l100 --voc-mode voc20 --voc20-ignore-background
+```
+
+Both dense-only modes save `metrics.json` and per-image prediction arrays under `predictions/`. They do not use SAM, DINOv2, or routing.
+
 To use the optional SAM mask backend:
 
 ```bash

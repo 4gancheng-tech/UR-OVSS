@@ -19,7 +19,14 @@ region/routing stack.
 A. **ClearCLIP Dense-Only**
 
 ```bash
-python eval_clearclip_dense_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_clearclip_dense_l100 --voc-mode voc20 --voc20-ignore-background
+python eval_dense_voc.py --semantic-backend clearclip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clearclip_l100 --voc-mode voc20 --voc20-ignore-background
+```
+
+For the paper-style vanilla CLIP dense baseline, use the same evaluator with
+`--semantic-backend clip`:
+
+```bash
+python eval_dense_voc.py --semantic-backend clip --voc-root path/to/VOCdevkit/VOC2012 --split val --limit 100 --output-dir outputs/voc_dense_clip_l100 --voc-mode voc20 --voc20-ignore-background
 ```
 
 B. **ClearCLIP + SAM**
@@ -53,6 +60,9 @@ python eval_pascal_voc.py --voc-root path/to/VOCdevkit/VOC2012 --split val --lim
   is probably dragging predictions down.
 - If D is close to C, dense ClearCLIP is not yet giving enough advantage over
   crop-level CLIP in this repository.
+- If vanilla CLIP dense-only is much weaker than ClearCLIP dense-only, the
+  ClearCLIP final-layer decomposition is carrying the semantic gain before SAM
+  or routing enter the pipeline.
 
 ## Official ClearCLIP Alignment Check
 
